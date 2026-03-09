@@ -95,6 +95,7 @@ def main() -> None:
         print(
             "  checks: "
             f"approach={result.checks['slow_grind_approach']} "
+            f"pre_entry_30m={result.checks['pre_entry_directional_30m']} "
             f"staircase={result.checks['left_side_staircase']} "
             f"volume={result.checks['volume_not_decreasing']} "
             f"not_choppy={result.checks['not_choppy']} "
@@ -110,6 +111,9 @@ def main() -> None:
             "  metrics: "
             f"net_move_10={result.metrics['net_move_10']:.4f} "
             f"opp_candles_10={int(result.metrics['opposite_candles_10'])} "
+            f"pre_entry_move_30m_pct={result.metrics.get('pre_entry_move_30m_pct', 0.0):.2f} "
+            f"pre_entry_eff_30m={result.metrics.get('pre_entry_efficiency_30m', 0.0):.2f} "
+            f"pre_entry_dir_ratio_30m={result.metrics.get('pre_entry_dir_bar_ratio_30m', 0.0):.2f} "
             f"smma30_slope={result.metrics['smma30_slope']:.5f} "
             f"smma120_slope={result.metrics['smma120_slope']:.5f} "
             f"staircase_bars_120={int(result.metrics['staircase_bars_120'])} "

@@ -22,6 +22,13 @@ class MomentumQualityResult:
     quality_tier: str = "unknown"  # "high" or "low"
 
 
+@dataclass
+class MomentumCheckConfig:
+    """Feature flags for momentum checks to allow isolated tuning."""
+
+    require_grind_subchecks_in_balanced_2h: bool = True
+
+
 def _smma(values: pd.Series, length: int) -> pd.Series:
     """Smoothed moving average (SMMA/RMA style)."""
     return values.ewm(alpha=1.0 / length, adjust=False).mean()
@@ -36,14 +43,14 @@ def _fetch_ticker_24h(symbol: str) -> dict:
     return response.json()
 
 
-def _fetch_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+def _fetch_klines(symbol: str, interval: str, limit: int, end_time_ms: int | None = None) -> pd.DataFrame:
     """Fetch klines and return OHLCV DataFrame."""
     url = "https://data-api.binance.vision/api/v3/klines"
-    response = requests.get(
-        url,
-        params={"symbol": symbol.upper(), "interval": interval, "limit": limit},
-        timeout=8,
-    )
+    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
+    if end_time_ms is not None:
+        params["endTime"] = int(end_time_ms)
+
+    response = requests.get(url, params=params, timeout=8)
     if response.status_code != 200:
         return pd.DataFrame()
     raw = response.json()
@@ -210,14 +217,16 @@ def _analyze_8min_grind_quality(df: pd.DataFrame, direction: str) -> Dict[str, f
     }
 
 
-def _balanced_momo_profile_2h(df: pd.DataFrame, direction: str) -> tuple[bool, Dict[str, float]]:
+def _balanced_momo_profile_2h(
+    df: pd.DataFrame,
+    direction: str,
+    require_grind_subchecks: bool = True,
+) -> tuple[bool, Dict[str, float]]:
     """
-    Validate 2h momentum profile sits between sideways and spike behavior.
+    Validate 2h momentum profile is directional and stable.
 
-    The profile should be directional and structured (not chop), but also not
-    so explosive that it resembles exhaustion-style spike action.
-    
-    Enhanced with 8-minute grind quality analysis to avoid both spikes and sideways chop.
+    This check is intentionally focused on 2-hour directional structure only.
+    Grind-quality subchecks are handled in the last 10 minutes near entry.
     """
     if df is None or len(df) < 120:
         return False, {
@@ -254,28 +263,25 @@ def _balanced_momo_profile_2h(df: pd.DataFrame, direction: str) -> tuple[bool, D
     path = close.pct_change().abs().fillna(0.0).sum()
     efficiency = float(dir_move / max(float(path), 1e-9))
 
-    # Get detailed 8-minute grind analysis
+    # Keep grind metrics for diagnostics only (not used for 2h pass/fail gating).
     grind_metrics = _analyze_8min_grind_quality(df, direction)
 
-    # 2h profile must show:
-    # 1. Meaningful directional movement (0.4-12%)
-    # 2. Not over-choppy (<=90% directional bars)
-    # 3. Max 8-min impulse <= 1.5% (not a single explosive spike)
-    # 4. Efficiency between 10-92%
-    # 5. Grind quality: majority of windows show progress (>=50% of ~14 windows at 0.2% threshold)
-    # 6. Average grind impulse in realistic range (0.3-1.2% - calibrated from real grinds)
-    # 7. Moderate consistency (std <=0.45% - allows natural variation)
-    # 8. Decent bar participation (>=40% bars contributing in grind windows)
-    balanced_ok = (
-        0.004 <= dir_move <= 0.120
-        and dir_bar_ratio <= 0.90
-        and max_dir_impulse_8m <= 0.015  # Raised from 1.0% to 1.5%
-        and 0.10 <= efficiency <= 0.92
-        and grind_metrics["grind_windows_count"] >= 7  # 50% of ~14 possible
-        and 0.30 <= grind_metrics["avg_grind_impulse_pct"] <= 1.20  # Real grinds are 0.9-1.05%
-        and grind_metrics["grind_impulse_std"] <= 0.0045  # 0.45% std (real grinds: 0.33-0.40%)
-        and grind_metrics["grind_bar_participation"] >= 0.40  # Real grinds: 47-65%
+    # Check regime age and stability
+    regime_age_bars, regime_age_ok = _detect_regime_age_2h(df, direction)
+    recent_break_detected, regime_stability_ok = _check_recent_high_low_break_2h(df, direction)
+    
+    # 2h profile must show directional action, but stay permissive enough
+    # to keep valid momentum regimes from being over-filtered.
+    base_balanced_ok = (
+        0.004 <= dir_move <= 0.350
+        and 0.45 <= dir_bar_ratio <= 0.98
+        and max_dir_impulse_8m <= 0.025
+        and 0.12 <= efficiency <= 0.90
+        and regime_age_bars >= 5
     )
+
+    # Intentionally ignore periodic 2h grind subchecks.
+    balanced_ok = base_balanced_ok
 
     return balanced_ok, {
         "dir_move_2h_pct": float(dir_move * 100.0),
@@ -286,6 +292,10 @@ def _balanced_momo_profile_2h(df: pd.DataFrame, direction: str) -> tuple[bool, D
         "avg_grind_impulse_pct": grind_metrics["avg_grind_impulse_pct"],
         "grind_impulse_std": grind_metrics["grind_impulse_std"],
         "grind_bar_participation": grind_metrics["grind_bar_participation"],
+        "regime_age_bars": float(regime_age_bars),
+        "regime_age_ok": regime_age_ok,
+        "recent_high_low_break": recent_break_detected,
+        "regime_stability_ok": regime_stability_ok,
     }
 
 
@@ -353,12 +363,246 @@ def _smma_spread_slowly_increasing_2h(df: pd.DataFrame, direction: str) -> tuple
     }
 
 
+def _momentum_noise_class_2h(smma30_slope: float, smma30_crosses_2h: float) -> tuple[str, str]:
+    """Classify momentum noise using 30 SMMA direction and crossover count."""
+    # Sideways MA direction is always high-noise for momentum.
+    if abs(float(smma30_slope)) <= 0.0005:
+        return "sideways", "high"
+
+    direction = "up" if smma30_slope > 0 else "down"
+    crosses = int(round(float(smma30_crosses_2h)))
+
+    if crosses <= 3:
+        noise = "low"
+    elif crosses <= 6:
+        noise = "medium"
+    else:
+        noise = "high"
+
+    return direction, noise
+
+
+def _calculate_entry_bar_concentration_30m(df: pd.DataFrame, direction: str) -> tuple[float, bool]:
+    """
+    Calculate what % of the 30m move came from the last 10 bars.
+    
+    High concentration (>60%) indicates a spike pattern that likely leads to pullback/entry failure.
+    Returns (concentration_pct, passes_filter)
+    """
+    if df is None or len(df) < 30:
+        return 0.0, False
+    
+    is_long = direction.lower() == "long"
+    tail = df.iloc[-30:]
+    close = tail["close"]
+    
+    # Total 30m move
+    start_30m = float(close.iloc[0])
+    end_30m = float(close.iloc[-1])
+    total_move_30m = (end_30m - start_30m) / max(abs(start_30m), 1e-9)
+    
+    # Move in last 10 bars
+    start_10b = float(close.iloc[-10])
+    end_10b = float(close.iloc[-1])
+    move_last_10b = (end_10b - start_10b) / max(abs(start_30m), 1e-9)
+    
+    # Avoid division by zero/near-zero moves
+    if abs(total_move_30m) < 1e-5:
+        concentration = 0.0
+    else:
+        concentration = abs(move_last_10b / total_move_30m)
+    
+    # Spike filter: if >60% of move is in final 10 bars, likely a spike
+    passes = concentration <= 0.60
+    
+    return concentration, passes
+
+
+def _detect_regime_age_2h(df: pd.DataFrame, direction: str) -> tuple[int, bool]:
+    """
+    Detect how old the current 2-hour directional regime is (in minutes/bars).
+    
+    Finds the bar where the 2h move started and returns age.
+    Relaxed check: flags if <10 bars old (very fresh, high risk), passes otherwise.
+    Returns (age_in_bars, passes_filter)
+    """
+    if df is None or len(df) < 120:
+        return 0, True  # Default to pass if insufficient data
+    
+    is_long = direction.lower() == "long"
+    left = df.iloc[-120:]
+    close = left["close"]
+    
+    # Find the bar where the current directional move initiated
+    # Walk backwards from current and find where trend reversed
+    regime_start_idx = 0
+    for i in range(len(close) - 1, 0, -1):
+        if is_long:
+            # For long: find where we went below previous bar
+            if close.iloc[i] < close.iloc[i-1]:
+                regime_start_idx = i + 1
+                break
+        else:
+            # For short: find where we went above previous bar
+            if close.iloc[i] > close.iloc[i-1]:
+                regime_start_idx = i + 1
+                break
+    
+    age_in_bars = len(close) - 1 - regime_start_idx
+    
+    # Much softer check: only reject if VERY fresh (<10 bars, ~10 minutes)
+    # User prefers 90+ but doesn't hard-reject fresh ones
+    passes = age_in_bars >= 10
+    
+    return age_in_bars, passes
+
+
+def _check_recent_high_low_break_2h(df: pd.DataFrame, direction: str) -> tuple[bool, bool]:
+    """
+    Check if extreme from earlier in 2h window got broken recently.
+    
+    Only flags regime instability if a SIGNIFICANT extreme (top 10% of moves)
+    from the middle window was broken in the final window.
+    Returns (recent_break_detected, passes_filter)
+    """
+    if df is None or len(df) < 120:
+        return False, True
+    
+    is_long = direction.lower() == "long"
+    left = df.iloc[-120:].copy()
+    
+    # First, calculate what a "significant" extreme would be
+    all_high = left["high"]
+    all_low = left["low"]
+    
+    if is_long:
+        # For long: track lows, significance = bottom 10th percentile
+        significant_threshold = all_low.quantile(0.10)
+    else:
+        # For short: track highs, significance = top 90th percentile  
+        significant_threshold = all_high.quantile(0.90)
+    
+    # Mid-window (bars 40-80 from end, i.e. indices 40-80 in 120-bar window)
+    mid_window = left.iloc[40:80]
+    
+    if is_long:
+        # For long setup: check if support below significance was broken
+        mid_significant = (mid_window["low"] <= significant_threshold).any()
+        if not mid_significant:
+            return False, True  # No significant low to watch
+        
+        # Recent window (bars 100-120, i.e. last 20 bars)
+        recent_window = left.iloc[-20:]
+        # Pass if we DON'T break that support
+        recent_break = (recent_window["low"] < significant_threshold).any()
+    else:
+        # For short setup: check if resistance above significance was broken
+        mid_significant = (mid_window["high"] >= significant_threshold).any()
+        if not mid_significant:
+            return False, True  # No significant high to watch
+        
+        # Recent window (bars 100-120, i.e. last 20 bars)
+        recent_window = left.iloc[-20:]
+        # Pass if we DON'T break that resistance
+        recent_break = (recent_window["high"] > significant_threshold).any()
+    
+    # Pass filter if NO significant break detected, or if no significant extreme to watch
+    passes = not recent_break
+    
+    return recent_break, passes
+
+
+def _pre_entry_directional_30m(df: pd.DataFrame, direction: str) -> tuple[bool, Dict[str, float]]:
+    """
+    Require directional structure into entry, with grind quality focused on last 10 minutes.
+    """
+    if df is None or len(df) < 30:
+        return False, {
+            "pre_entry_move_30m_pct": 0.0,
+            "pre_entry_efficiency_30m": 0.0,
+            "pre_entry_dir_bar_ratio_30m": 0.0,
+            "pre_entry_spike_concentration_pct": 0.0,
+            "pre_entry_bar_concentration_ok": False,
+            "pre_entry_move_10m_pct": 0.0,
+            "pre_entry_efficiency_10m": 0.0,
+            "pre_entry_dir_bar_ratio_10m": 0.0,
+            "pre_entry_opp_candles_10m": 0.0,
+            "pre_entry_grind_10m_ok": False,
+        }
+
+    is_long = direction.lower() == "long"
+    tail = df.iloc[-30:]
+    close = tail["close"]
+
+    start = float(close.iloc[0])
+    end = float(close.iloc[-1])
+    raw_move = (end - start) / max(abs(start), 1e-9)
+    dir_move = raw_move if is_long else -raw_move
+
+    diff = close.diff().fillna(0.0)
+    dir_bars = (diff > 0).sum() if is_long else (diff < 0).sum()
+    dir_bar_ratio = float(dir_bars) / max(len(diff), 1)
+
+    path = close.pct_change().abs().fillna(0.0).sum()
+    efficiency = float(dir_move / max(float(path), 1e-9))
+
+    # Last 10m grind-quality check (entry-critical).
+    tail10 = tail.iloc[-10:]
+    close10 = tail10["close"]
+    start10 = float(close10.iloc[0])
+    end10 = float(close10.iloc[-1])
+    raw_move_10m = (end10 - start10) / max(abs(start10), 1e-9)
+    dir_move_10m = raw_move_10m if is_long else -raw_move_10m
+
+    diff10 = close10.diff().fillna(0.0)
+    dir_bars_10m = (diff10 > 0).sum() if is_long else (diff10 < 0).sum()
+    dir_bar_ratio_10m = float(dir_bars_10m) / max(len(diff10), 1)
+    opp_candles_10m = int((diff10 < 0).sum()) if is_long else int((diff10 > 0).sum())
+
+    path10 = close10.pct_change().abs().fillna(0.0).sum()
+    efficiency10 = float(dir_move_10m / max(float(path10), 1e-9))
+
+    grind_10m_ok = (
+        dir_move_10m >= 0.0020
+        and dir_bar_ratio_10m >= 0.60
+        and 0.30 <= efficiency10 <= 0.95
+        and opp_candles_10m <= 4
+    )
+
+    # NEW: Spike concentration check
+    spike_concentration, concentration_ok = _calculate_entry_bar_concentration_30m(df, direction)
+    
+    # Entry check now prioritizes last-10-minute grind quality plus anti-spike distribution.
+    pre_entry_ok = (
+        dir_move >= 0.004
+        and dir_bar_ratio >= 0.50  # TIGHTENED from 0.40
+        and efficiency >= 0.20
+        and concentration_ok  # NEW: must not be spike pattern
+        and grind_10m_ok
+    )
+
+    return pre_entry_ok, {
+        "pre_entry_move_30m_pct": float(dir_move * 100.0),
+        "pre_entry_efficiency_30m": float(efficiency),
+        "pre_entry_dir_bar_ratio_30m": float(dir_bar_ratio),
+        "pre_entry_spike_concentration_pct": float(spike_concentration * 100.0),
+        "pre_entry_bar_concentration_ok": concentration_ok,
+        "pre_entry_move_10m_pct": float(dir_move_10m * 100.0),
+        "pre_entry_efficiency_10m": float(efficiency10),
+        "pre_entry_dir_bar_ratio_10m": float(dir_bar_ratio_10m),
+        "pre_entry_opp_candles_10m": float(opp_candles_10m),
+        "pre_entry_grind_10m_ok": grind_10m_ok,
+    }
+
+
 def evaluate_momentum_setup(
     df: pd.DataFrame,
     direction: str,
     min_quality_score: float = 0.60,
     symbol: str | None = None,
     enforce_extended_rules: bool = False,
+    eval_time: pd.Timestamp | None = None,
+    check_config: MomentumCheckConfig | None = None,
 ) -> MomentumQualityResult:
     """
     Evaluate whether the current momentum signal is high quality.
@@ -369,6 +613,8 @@ def evaluate_momentum_setup(
     - avoid decreasing volume profile
     - reject obvious chop
     """
+    cfg = check_config or MomentumCheckConfig()
+
     if df is None or len(df) < 120:
         return MomentumQualityResult(
             direction=direction,
@@ -377,6 +623,7 @@ def evaluate_momentum_setup(
             checks={
                 "enough_data": False,
                 "slow_grind_approach": False,
+                "pre_entry_directional_30m": False,
                 "left_side_staircase": False,
                 "volume_not_decreasing": False,
                 "not_choppy": False,
@@ -408,6 +655,9 @@ def evaluate_momentum_setup(
         opposite_candles = int((approach["close"].diff() > 0).sum())
         approach_ok = net_move < 0 and opposite_candles <= 4
 
+    # Rule 1b: Entry window should not be sideways over the last 30m.
+    pre_entry_directional_30m, pre_entry_metrics = _pre_entry_directional_30m(work, side)
+
     # Rule 2: Left side staircase context (roughly last 2h)
     left = work.iloc[-120:]
     smma30_slope = _linear_slope(left["smma30"])
@@ -438,18 +688,22 @@ def evaluate_momentum_setup(
     vol_slope = _linear_slope(vol_slice)
     volume_ok = vol_slope > -0.02
 
-    # Rule 4: Anti-chop filter
-    # If price keeps crossing 30SMMA repeatedly, it behaves like chop.
-    side_of_smma = np.sign(work["close"].iloc[-60:] - work["smma30"].iloc[-60:])
-    side_changes = int(np.sum(np.abs(np.diff(side_of_smma.fillna(0).to_numpy())) > 0))
-    choppy = side_changes >= 14
-    not_choppy = not choppy
-
     # Rule 5: 2h profile should be between sideways and spike behavior.
-    balanced_momo_2h, balanced_metrics = _balanced_momo_profile_2h(work, side)
+    balanced_momo_2h, balanced_metrics = _balanced_momo_profile_2h(
+        work,
+        side,
+        require_grind_subchecks=cfg.require_grind_subchecks_in_balanced_2h,
+    )
 
     # Rule 6: Price should stay parallel to 30SMMA (limited criss-cross).
     parallel_to_smma30_2h, parallel_metrics = _price_parallel_to_smma30_2h(work, side)
+
+    # Rule 4: Noise model from 30 SMMA PDF (direction + cross-count).
+    smma30_direction_2h, noise_class_momentum = _momentum_noise_class_2h(
+        smma30_slope=smma30_slope,
+        smma30_crosses_2h=parallel_metrics["smma30_crosses_2h"],
+    )
+    not_choppy = noise_class_momentum != "high"
 
     # Rule 7: Distance between 30SMMA and 120SMMA should gradually increase.
     smma_spread_increasing_2h, spread_metrics = _smma_spread_slowly_increasing_2h(work, side)
@@ -457,6 +711,7 @@ def evaluate_momentum_setup(
     checks = {
         "enough_data": True,
         "slow_grind_approach": approach_ok,
+        "pre_entry_directional_30m": pre_entry_directional_30m,
         "left_side_staircase": staircase_ok,
         "volume_not_decreasing": volume_ok,
         "not_choppy": not_choppy,
@@ -482,11 +737,37 @@ def evaluate_momentum_setup(
             checks["first_2h_prev_day_vwap_ok"] = False
         else:
             # Rule A: day change threshold (>= +5% for long, <= -5% for short)
-            ticker = _fetch_ticker_24h(symbol)
-            if ticker:
-                day_change_pct = float(ticker.get("priceChangePercent", 0.0))
+            if eval_time is None:
+                ticker = _fetch_ticker_24h(symbol)
+                if ticker:
+                    day_change_pct = float(ticker.get("priceChangePercent", 0.0))
+                else:
+                    day_change_pct = float("nan")
+                eval_ts = pd.Timestamp.utcnow()
+                if eval_ts.tzinfo is None:
+                    eval_ts = eval_ts.tz_localize("UTC")
+                end_time_ms = None
             else:
-                day_change_pct = float("nan")
+                eval_ts = pd.Timestamp(eval_time)
+                if eval_ts.tzinfo is None:
+                    eval_ts = eval_ts.tz_localize("UTC")
+                else:
+                    eval_ts = eval_ts.tz_convert("UTC")
+                end_time_ms = int(eval_ts.timestamp() * 1000)
+
+                # Historical 24h change approximation from 5m closes ending at eval time.
+                day_change_df = _fetch_klines(symbol, interval="5m", limit=320, end_time_ms=end_time_ms)
+                if not day_change_df.empty:
+                    cutoff_ts = eval_ts - pd.Timedelta(hours=24)
+                    last_24h = day_change_df[(day_change_df.index >= cutoff_ts) & (day_change_df.index <= eval_ts)]
+                    if len(last_24h) >= 2:
+                        start_px = float(last_24h["close"].iloc[0])
+                        end_px = float(last_24h["close"].iloc[-1])
+                        day_change_pct = ((end_px - start_px) / max(abs(start_px), 1e-9)) * 100.0
+                    else:
+                        day_change_pct = float("nan")
+                else:
+                    day_change_pct = float("nan")
 
             if is_long:
                 checks["day_change_ok"] = bool(day_change_pct >= 5.0)
@@ -494,11 +775,9 @@ def evaluate_momentum_setup(
                 checks["day_change_ok"] = bool(day_change_pct <= -5.0)
 
             # Rule B/C: VWAP side + first 2h previous day VWAP requirement
-            vwap_df = _fetch_klines(symbol, interval="5m", limit=600)
+            vwap_df = _fetch_klines(symbol, interval="5m", limit=600, end_time_ms=end_time_ms)
             if not vwap_df.empty:
-                now_ts = pd.Timestamp.utcnow()
-                if now_ts.tzinfo is None:
-                    now_ts = now_ts.tz_localize("UTC")
+                now_ts = eval_ts
 
                 today = now_ts.date()
                 yesterday = (now_ts - pd.Timedelta(days=1)).date()
@@ -562,6 +841,7 @@ def evaluate_momentum_setup(
     # Core momentum checklist must pass first.
     core_ok = (
         checks["slow_grind_approach"]
+        and checks["pre_entry_directional_30m"]
         and checks["left_side_staircase"]
         and checks["volume_not_decreasing"]
         and checks["not_choppy"]
@@ -601,12 +881,24 @@ def evaluate_momentum_setup(
     metrics = {
         "net_move_10": float(net_move),
         "opposite_candles_10": float(opposite_candles),
+        "pre_entry_move_30m_pct": float(pre_entry_metrics["pre_entry_move_30m_pct"]),
+        "pre_entry_efficiency_30m": float(pre_entry_metrics["pre_entry_efficiency_30m"]),
+        "pre_entry_dir_bar_ratio_30m": float(pre_entry_metrics["pre_entry_dir_bar_ratio_30m"]),
+        "pre_entry_spike_concentration_pct": float(pre_entry_metrics["pre_entry_spike_concentration_pct"]),
+        "pre_entry_bar_concentration_ok": float(1 if pre_entry_metrics["pre_entry_bar_concentration_ok"] else 0),
+        "pre_entry_move_10m_pct": float(pre_entry_metrics["pre_entry_move_10m_pct"]),
+        "pre_entry_efficiency_10m": float(pre_entry_metrics["pre_entry_efficiency_10m"]),
+        "pre_entry_dir_bar_ratio_10m": float(pre_entry_metrics["pre_entry_dir_bar_ratio_10m"]),
+        "pre_entry_opp_candles_10m": float(pre_entry_metrics["pre_entry_opp_candles_10m"]),
+        "pre_entry_grind_10m_ok": float(1 if pre_entry_metrics["pre_entry_grind_10m_ok"] else 0),
         "smma30_slope": float(smma30_slope),
         "smma120_slope": float(smma120_slope),
         "staircase_bars_120": float(staircase_bars),
         "trend_stack_bars_120": float(trend_stack_bars),
         "vol_slope": float(vol_slope),
-        "smma_side_changes_60": float(side_changes),
+        "smma_side_changes_60": float(parallel_metrics["smma30_crosses_2h"]),
+        "smma30_direction_2h": 1.0 if smma30_direction_2h == "up" else (-1.0 if smma30_direction_2h == "down" else 0.0),
+        "noise_class_momentum": 0.0 if noise_class_momentum == "low" else (1.0 if noise_class_momentum == "medium" else 2.0),
         "day_change_pct": float(day_change_pct),
         "current_day_vwap": float(current_vwap),
         "prev_day_vwap": float(prev_day_vwap),
@@ -617,6 +909,10 @@ def evaluate_momentum_setup(
         "dir_bar_ratio_2h": float(balanced_metrics["dir_bar_ratio_2h"]),
         "max_dir_impulse_8m_pct": float(balanced_metrics["max_dir_impulse_8m_pct"]),
         "efficiency_2h": float(balanced_metrics["efficiency_2h"]),
+        "regime_age_bars": float(balanced_metrics["regime_age_bars"]),
+        "regime_age_ok": float(1 if balanced_metrics["regime_age_ok"] else 0),
+        "recent_high_low_break": float(1 if balanced_metrics["recent_high_low_break"] else 0),
+        "regime_stability_ok": float(1 if balanced_metrics["regime_stability_ok"] else 0),
         "grind_windows_count": float(balanced_metrics["grind_windows_count"]),
         "avg_grind_impulse_pct": float(balanced_metrics["avg_grind_impulse_pct"]),
         "grind_impulse_std": float(balanced_metrics["grind_impulse_std"]),
@@ -625,6 +921,7 @@ def evaluate_momentum_setup(
         "smma30_trend_side_ratio_2h": float(parallel_metrics["smma30_trend_side_ratio_2h"]),
         "smma_spread_slope_2h": float(spread_metrics["smma_spread_slope_2h"]),
         "smma_spread_up_ratio_2h": float(spread_metrics["smma_spread_up_ratio_2h"]),
+        "grind_subchecks_enabled": float(1 if cfg.require_grind_subchecks_in_balanced_2h else 0),
     }
 
     return MomentumQualityResult(

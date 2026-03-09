@@ -158,6 +158,7 @@ def append_passes(path: Path, run_ts: str, passes: list[tuple[str, str, object]]
                     int(quality.metrics.get("trend_stack_bars_120", 0)),
                     (
                         f"approach={quality.checks.get('slow_grind_approach')}|"
+                        f"pre_entry_30m={quality.checks.get('pre_entry_directional_30m')}|"
                         f"staircase={quality.checks.get('left_side_staircase')}|"
                         f"volume={quality.checks.get('volume_not_decreasing')}|"
                         f"not_choppy={quality.checks.get('not_choppy')}|"
