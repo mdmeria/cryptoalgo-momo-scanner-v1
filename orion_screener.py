@@ -25,9 +25,10 @@ class OrionTerminalScreener:
         min_volume_5m: float = 100000,
         quote_currency: str = "USDT",
         lookback_minutes: int = 5,
+        force_refresh: bool = False,
     ) -> List[Dict]:
         """Return top coins ranked by recent activity from Orion's Binance-based feed."""
-        if self._is_cache_valid():
+        if not force_refresh and self._is_cache_valid():
             return self._cache[:top_n]
 
         payload = self._fetch_payload()

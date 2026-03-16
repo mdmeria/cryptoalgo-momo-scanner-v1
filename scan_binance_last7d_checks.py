@@ -240,6 +240,7 @@ def evaluate_symbol_at_all_timestamps(
                 "left_side_staircase": bool(res_on.checks.get("left_side_staircase", False)),
                 "volume_not_decreasing": bool(res_on.checks.get("volume_not_decreasing", False)),
                 "not_choppy": bool(res_on.checks.get("not_choppy", False)),
+                "momentum_geometry_2h": bool(res_on.checks.get("momentum_geometry_2h", False)),
                 "balanced_momo_2h_grind_on": bool(res_on.checks.get("balanced_momo_2h", False)),
                 "balanced_momo_2h_grind_off": bool(res_off.checks.get("balanced_momo_2h", False)),
                 "day_change_ok": bool(day_change_ok),
@@ -253,6 +254,12 @@ def evaluate_symbol_at_all_timestamps(
                 "smma30_crosses_2h": float(res_on.metrics.get("smma30_crosses_2h", float("nan"))),
                 "smma30_direction_2h": float(res_on.metrics.get("smma30_direction_2h", float("nan"))),
                 "noise_class_momentum": float(res_on.metrics.get("noise_class_momentum", float("nan"))),
+                "geom_norm_slope_2h": float(res_on.metrics.get("geom_norm_slope_2h", float("nan"))),
+                "geom_r2_2h": float(res_on.metrics.get("geom_r2_2h", float("nan"))),
+                "geom_er_2h": float(res_on.metrics.get("geom_er_2h", float("nan"))),
+                "geom_dir_consistency_2h": float(res_on.metrics.get("geom_dir_consistency_2h", float("nan"))),
+                "geom_pullback_atr_2h": float(res_on.metrics.get("geom_pullback_atr_2h", float("nan"))),
+                "geom_score_2h": float(res_on.metrics.get("geom_score_2h", float("nan"))),
                 "pre_entry_move_30m_pct": float(res_on.metrics.get("pre_entry_move_30m_pct", float("nan"))),
                 "pre_entry_efficiency_30m": float(res_on.metrics.get("pre_entry_efficiency_30m", float("nan"))),
                 "pre_entry_move_10m_pct": float(res_on.metrics.get("pre_entry_move_10m_pct", float("nan"))),
@@ -288,6 +295,14 @@ def evaluate_symbol_at_all_timestamps(
                     row["first_2h_prev_day_vwap_ok"],
                     row["entry_not_crossed_6h"],
                 ]
+            )
+
+            # Geometry can be toggled as an additional hard gate during tuning.
+            row["overall_pass_grind_on_geom"] = bool(
+                row["overall_pass_grind_on"] and row["momentum_geometry_2h"]
+            )
+            row["overall_pass_grind_off_geom"] = bool(
+                row["overall_pass_grind_off"] and row["momentum_geometry_2h"]
             )
 
             results.append(row)

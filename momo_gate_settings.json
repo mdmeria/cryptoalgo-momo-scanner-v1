@@ -1,0 +1,53 @@
+{
+  "enable_2h_gate": false,
+  "enable_ema7_cross_gate": false,
+  "enable_staircase_gate": true,
+  "enable_10m_gate": false,
+  "enable_30m_noise_gate": true,
+  "enable_5m_antispike_gate": true,
+  "enable_volusd_gate": true,
+  "enable_regime_breakout_gate": false,
+  "enable_vwap_side_gate": true,
+  "enable_tp_sl_keylevel_gate": true,
+  "enable_rr_guard": true,
+  "enable_min_tp_sl_pct_gate": true,
+  "enable_last15m_gate": true,
+
+  "grind10_min": 0.52,
+  "wick_ratio_10m_max": 0.55,
+  "angle_min_deg": 15.0,
+  "angle_max_deg": 75.0,
+
+  "dir_lookback_bars": 120,
+  "dir_move_min_pct": 1.0,
+  "dir_eff_min": 0.12,
+  "chop_range_pct": 0.3,
+
+  "noise_wick_30m_max": 0.55,
+  "spike5_max_abs_ret_pct": 1.5,
+  "spike5_max_range_pct": 2.5,
+
+  "staircase_dir_pct_min": 55.0,
+  "staircase_max_ret_std": 0.20,
+  "staircase_wick_max": 0.45,
+  "staircase_abv_ma_min": 80.0,
+  "staircase_max_crosses_smma": 2,
+  "staircase_min_consistent_segs": 5,
+
+  "last15m_dir_pct_min": 60.0,
+  "last15m_dir_pct_max": 80.0,
+  "last15m_net_move_min": 0.2,
+  "last15m_abv_ma_min": 80.0,
+  "last15m_hl_min": 8,
+  "last15m_max_pullback_pct": 0.5,
+  "last15m_min_pullback_pct": 0.2,
+  "last15m_max_consecutive": 5,
+  "last15m_vol_steady_min": 60.0,
+
+  "day_change_pct": 5.0,
+  "min_profit_pct": 1.0,
+
+  "min_vol_usd_5m": 0,
+  "entry_not_crossed_6h": true,
+  "rr": 1.1
+}

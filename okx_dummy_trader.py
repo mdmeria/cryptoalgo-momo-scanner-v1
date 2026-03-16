@@ -7,7 +7,8 @@ import argparse
 import time
 import uuid
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -15,10 +16,17 @@ import pandas as pd
 import requests
 
 from momentum_quality import MomentumCheckConfig, evaluate_momentum_setup
+from orion_screener import OrionTerminalScreener
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def est_now_iso() -> str:
+    # Keep fixed EST (-05:00) for consistency with other screener logs.
+    est_now = datetime.now(timezone.utc) - timedelta(hours=5)
+    return est_now.strftime("%Y-%m-%dT%H:%M:%S-05:00")
 
 
 def to_float(value, default: float = 0.0) -> float:
@@ -38,22 +46,31 @@ class OKXDummyTrader:
         max_new_trades_per_cycle: int,
         min_volume_5m: float,
         diagnostics_file: Optional[str] = None,
+        min_trade_count_5m: int = 1000,
     ):
         self.log_file = log_file
         self.interval_sec = interval_sec
         self.max_new_trades_per_cycle = max_new_trades_per_cycle
-        self.min_volume_5m = min_volume_5m
+        self.min_volume_5m = min_volume_5m  # Kept for backward compat, not used
+        self.min_trade_count_5m = min_trade_count_5m
         self.diagnostics_file = diagnostics_file
+        self.failure_log_file = None
+        if self.diagnostics_file:
+            diag_path = Path(self.diagnostics_file)
+            self.failure_log_file = str(diag_path.with_name(f"{diag_path.stem}_coin_failures.csv"))
         self.session = requests.Session()
+        self.orion_screener = OrionTerminalScreener()
         self.iteration = 0
         self._ensure_log_file()
         if self.diagnostics_file:
             self._ensure_diagnostics_file()
+            self._ensure_failure_log_file()
 
     def _ensure_log_file(self) -> None:
         cols = [
             "trade_id",
             "created_at_utc",
+            "created_at_est",
             "symbol",
             "direction",
             "entry_price",
@@ -63,6 +80,7 @@ class OKXDummyTrader:
             "tp_distance_pct",
             "status",
             "exit_time_utc",
+            "exit_time_est",
             "exit_price",
             "exit_reason",
             "pnl_pct",
@@ -102,29 +120,91 @@ class OKXDummyTrader:
 
     def _ensure_diagnostics_file(self) -> None:
         import os
-        if not os.path.exists(self.diagnostics_file):
-            cols = [
-                "timestamp_utc",
-                "iteration",
-                "total_evaluated",
-                "total_passed",
-                "total_opened",
-                "non_evaluable",
-                "slow_grind_approach_fails",
-                "left_side_staircase_fails",
-                "volume_not_decreasing_fails",
-                "not_choppy_fails",
-                "day_change_ok_fails",
-                "vwap_side_ok_fails",
-                "first_2h_prev_day_vwap_ok_fails",
-                "entry_not_crossed_6h_fails",
-            ]
-            try:
+        cols = [
+            "timestamp_utc",
+            "timestamp_est",
+            "iteration",
+            "total_evaluated",
+            "total_passed",
+            "total_opened",
+            "non_evaluable",
+            "non_evaluable_insufficient_data",
+            "non_evaluable_low_volume_5m",
+            "non_evaluable_runtime_none",
+            "non_evaluable_unknown",
+            "slow_grind_approach_fails",
+            "left_side_staircase_fails",
+            "volume_not_decreasing_fails",
+            "not_choppy_fails",
+            "day_change_ok_fails",
+            "vwap_side_ok_fails",
+            "first_2h_prev_day_vwap_ok_fails",
+            "entry_not_crossed_6h_fails",
+        ]
+
+        try:
+            if not os.path.exists(self.diagnostics_file):
                 df = pd.DataFrame(columns=cols)
                 df.to_csv(self.diagnostics_file, index=False)
                 print(f"[DIAG] created {self.diagnostics_file}")
-            except Exception as exc:
-                print(f"[DIAG] create_error={exc}")
+                return
+
+            # Upgrade existing diagnostics schema in place if new columns were added.
+            existing = pd.read_csv(self.diagnostics_file)
+            changed = False
+            for col in cols:
+                if col not in existing.columns:
+                    existing[col] = 0
+                    changed = True
+            if changed:
+                existing = existing[cols]
+                existing.to_csv(self.diagnostics_file, index=False)
+                print(f"[DIAG] upgraded_schema {self.diagnostics_file}")
+        except Exception as exc:
+            print(f"[DIAG] create_error={exc}")
+
+    def _ensure_failure_log_file(self) -> None:
+        if not self.failure_log_file:
+            return
+
+        cols = [
+            "timestamp_utc",
+            "timestamp_est",
+            "iteration",
+            "symbol",
+            "direction",
+            "status",
+            "non_evaluable_reason",
+            "failed_checks",
+            "checks_true_count",
+            "score",
+            "day_change_pct",
+            "entry_cross_count_6h",
+            "dir_move_2h_pct",
+            "efficiency_2h",
+        ]
+        try:
+            existing = pd.read_csv(self.failure_log_file)
+            changed = False
+            for col in cols:
+                if col not in existing.columns:
+                    existing[col] = ""
+                    changed = True
+            if changed:
+                existing = existing[cols]
+                existing.to_csv(self.failure_log_file, index=False)
+                print(f"[DIAG] upgraded_schema {self.failure_log_file}")
+        except Exception:
+            pd.DataFrame(columns=cols).to_csv(self.failure_log_file, index=False)
+            print(f"[DIAG] created {self.failure_log_file}")
+
+    def _append_failure_rows(self, rows: list[dict]) -> None:
+        if not self.failure_log_file or not rows:
+            return
+        try:
+            pd.DataFrame(rows).to_csv(self.failure_log_file, mode="a", header=False, index=False)
+        except Exception as exc:
+            print(f"[DIAG] failure_write_error={exc}")
 
     def _write_diagnostics_row(
         self,
@@ -133,17 +213,23 @@ class OKXDummyTrader:
         opened: int,
         non_evaluable: int,
         fail_counter: Counter,
+        non_evaluable_counter: Counter,
     ) -> None:
         if not self.diagnostics_file:
             return
 
         row = {
             "timestamp_utc": utc_now_iso(),
+            "timestamp_est": est_now_iso(),
             "iteration": self.iteration,
             "total_evaluated": evaluated,
             "total_passed": passed,
             "total_opened": opened,
             "non_evaluable": non_evaluable,
+            "non_evaluable_insufficient_data": non_evaluable_counter.get("insufficient_data", 0),
+            "non_evaluable_low_volume_5m": non_evaluable_counter.get("low_volume_5m", 0),
+            "non_evaluable_runtime_none": non_evaluable_counter.get("runtime_none", 0),
+            "non_evaluable_unknown": non_evaluable_counter.get("unknown", 0),
             "slow_grind_approach_fails": fail_counter.get("slow_grind_approach", 0),
             "left_side_staircase_fails": fail_counter.get("left_side_staircase", 0),
             "volume_not_decreasing_fails": fail_counter.get("volume_not_decreasing", 0),
@@ -179,6 +265,42 @@ class OKXDummyTrader:
                     out.append(inst_id)
             return sorted(set(out))
         except Exception:
+            return []
+
+    def _get_orion_filtered_okx_symbols(self) -> list[str]:
+        """Get OKX symbols pre-filtered by Orion screener (5min trade count > threshold)."""
+        try:
+            # Get all symbols from Orion with high 5min trade activity
+            # Using large top_n and low volume to get all active coins, filter by trades
+            orion_coins = self.orion_screener.get_top_coins_by_recent_activity(
+                top_n=500,  # Get many symbols
+                min_volume_5m=1000,  # Low volume threshold, we filter by trades instead
+                quote_currency="USDT",
+                lookback_minutes=5,
+                force_refresh=True,
+            )
+            
+            # Filter by trade count threshold
+            high_activity = [c for c in orion_coins if c.get("trades", 0) >= self.min_trade_count_5m]
+            
+            if not high_activity:
+                print(f"[ORION] No symbols found with trades >= {self.min_trade_count_5m}")
+                return []
+            
+            # Map Orion symbols (e.g., "BTCUSDT") to OKX format (e.g., "BTC-USDT-SWAP")
+            okx_symbols = []
+            for coin in high_activity:
+                orion_symbol = coin["symbol"]  # e.g., "BTCUSDT"
+                # Remove "USDT" suffix and add OKX swap format
+                if orion_symbol.endswith("USDT"):
+                    base = orion_symbol[:-4]  # Remove "USDT"
+                    okx_symbol = f"{base}-USDT-SWAP"
+                    okx_symbols.append(okx_symbol)
+            
+            print(f"[ORION] Filtered {len(okx_symbols)} symbols with trades >= {self.min_trade_count_5m}")
+            return okx_symbols
+        except Exception as e:
+            print(f"[ORION] Error fetching from screener: {e}")
             return []
 
     def _fetch_ohlcv(self, inst_id: str, bar: str, limit: int) -> Optional[pd.DataFrame]:
@@ -446,16 +568,10 @@ class OKXDummyTrader:
                 "failed_checks_list": [],
             }
 
-        # Volume gate (last 5 bars average, USD-equivalent)
-        vol_usd_5m = df_1m["volume"].tail(5) * df_1m["close"].tail(5)
-        avg_vol_5m = float(vol_usd_5m.mean())
-        if avg_vol_5m < self.min_volume_5m:
-            return {
-                "symbol": symbol,
-                "overall_pass": False,
-                "non_evaluable": "low_volume_5m",
-                "failed_checks_list": [],
-            }
+        avg_vol_5m = float(df_1m["volume"].iloc[-5:].mean()) if len(df_1m) >= 5 else float("nan")
+
+        # Volume gate removed - Orion screener pre-filters by 5min trade count
+        # All symbols reaching this point already passed trade activity threshold
 
         eval_ts = df_1m.index[-1]
         best_fail: Optional[dict] = None
@@ -495,6 +611,10 @@ class OKXDummyTrader:
                     "overall_pass": False,
                     "failed_checks_list": failed,
                     "checks_true_count": sum(1 for v in checks.values() if v),
+                    "score": float(getattr(quality, "score", 0.0)),
+                    "day_change_pct": day_change_pct,
+                    "entry_cross_count_6h": entry_cross_count,
+                    "metrics": quality.metrics,
                 }
                 if best_fail is None or candidate["checks_true_count"] > best_fail["checks_true_count"]:
                     best_fail = candidate
@@ -521,6 +641,7 @@ class OKXDummyTrader:
                 "avg_volume_5m": avg_vol_5m,
                 "day_change_pct": day_change_pct,
                 "entry_cross_count_6h": entry_cross_count,
+                "score": float(getattr(quality, "score", 0.0)),
                 "metrics": quality.metrics,
             }
 
@@ -575,28 +696,32 @@ class OKXDummyTrader:
                 pnl_pct = ((exit_px - entry) / entry) * 100 if direction == "long" else ((entry - exit_px) / entry) * 100
                 trades.at[idx, "status"] = "CLOSED"
                 trades.at[idx, "exit_time_utc"] = now.isoformat()
+                trades.at[idx, "exit_time_est"] = est_now_iso()
                 trades.at[idx, "exit_price"] = round(exit_px, 8)
                 trades.at[idx, "exit_reason"] = exit_reason
                 trades.at[idx, "pnl_pct"] = round(pnl_pct, 4)
                 trades.at[idx, "time_in_trade_min"] = round(mins, 2)
-                print(f"[EXIT] {symbol} {direction} {exit_reason} pnl={pnl_pct:.2f}%")
+                print(f"[{est_now_iso()}] [EXIT] {symbol} {direction} {exit_reason} pnl={pnl_pct:.2f}%")
 
         return trades
 
     def _open_new_trades(self, trades: pd.DataFrame) -> pd.DataFrame:
         open_symbols = set(trades.loc[trades["status"] == "OPEN", "symbol"].tolist())
 
-        universe = self._get_all_usdt_swaps()
+        # Use Orion screener to get only high-activity symbols (5min trade count filter)
+        universe = self._get_orion_filtered_okx_symbols()
         if not universe:
-            print("[SCAN] no OKX USDT swaps fetched")
+            print("[SCAN] no symbols from Orion screener")
             return trades
 
-        print(f"[SCAN] evaluating {len(universe)} OKX USDT swaps")
+        print(f"[SCAN] evaluating {len(universe)} Orion-filtered OKX symbols (trades>={self.min_trade_count_5m})")
         opened = 0
         passed_count = 0
         evaluated_count = 0
         non_evaluable_count = 0
         fail_counter: Counter = Counter()
+        non_evaluable_counter: Counter = Counter()
+        failure_rows: list[dict] = []
 
         for symbol in universe:
             if opened >= self.max_new_trades_per_cycle:
@@ -607,15 +732,73 @@ class OKXDummyTrader:
             eval_result = self._evaluate_symbol(symbol)
             if eval_result is None:
                 non_evaluable_count += 1
+                non_evaluable_counter["runtime_none"] += 1
+                failure_rows.append(
+                    {
+                        "timestamp_utc": utc_now_iso(),
+                        "timestamp_est": est_now_iso(),
+                        "iteration": self.iteration,
+                        "symbol": symbol,
+                        "direction": "",
+                        "status": "NON_EVALUABLE",
+                        "non_evaluable_reason": "runtime_none",
+                        "failed_checks": "",
+                        "checks_true_count": 0,
+                        "score": "",
+                        "day_change_pct": "",
+                        "entry_cross_count_6h": "",
+                        "dir_move_2h_pct": "",
+                        "efficiency_2h": "",
+                    }
+                )
                 continue
             if eval_result.get("non_evaluable"):
                 non_evaluable_count += 1
+                reason = str(eval_result.get("non_evaluable") or "unknown")
+                non_evaluable_counter[reason] += 1
+                failure_rows.append(
+                    {
+                        "timestamp_utc": utc_now_iso(),
+                        "timestamp_est": est_now_iso(),
+                        "iteration": self.iteration,
+                        "symbol": symbol,
+                        "direction": "",
+                        "status": "NON_EVALUABLE",
+                        "non_evaluable_reason": reason,
+                        "failed_checks": "",
+                        "checks_true_count": 0,
+                        "score": "",
+                        "day_change_pct": "",
+                        "entry_cross_count_6h": "",
+                        "dir_move_2h_pct": "",
+                        "efficiency_2h": "",
+                    }
+                )
                 continue
 
             evaluated_count += 1
             if not bool(eval_result.get("overall_pass", False)):
                 for check_name in eval_result.get("failed_checks_list", []):
                     fail_counter[check_name] += 1
+                metrics = eval_result.get("metrics", {}) or {}
+                failure_rows.append(
+                    {
+                        "timestamp_utc": utc_now_iso(),
+                        "timestamp_est": est_now_iso(),
+                        "iteration": self.iteration,
+                        "symbol": symbol,
+                        "direction": str(eval_result.get("direction", "")),
+                        "status": "FAILED_CHECKS",
+                        "non_evaluable_reason": "",
+                        "failed_checks": "|".join(eval_result.get("failed_checks_list", [])),
+                        "checks_true_count": int(eval_result.get("checks_true_count", 0)),
+                        "score": round(float(eval_result.get("score", 0.0)), 4),
+                        "day_change_pct": round(float(eval_result.get("day_change_pct", float("nan"))), 4),
+                        "entry_cross_count_6h": int(eval_result.get("entry_cross_count_6h", -1)),
+                        "dir_move_2h_pct": round(float(metrics.get("dir_move_2h_pct", float("nan"))), 4),
+                        "efficiency_2h": round(float(metrics.get("efficiency_2h", float("nan"))), 4),
+                    }
+                )
                 continue
 
             passed_count += 1
@@ -628,6 +811,7 @@ class OKXDummyTrader:
             row = {
                 "trade_id": str(uuid.uuid4())[:8],
                 "created_at_utc": utc_now_iso(),
+                "created_at_est": est_now_iso(),
                 "symbol": symbol,
                 "direction": direction,
                 "entry_price": round(entry, 8),
@@ -637,6 +821,7 @@ class OKXDummyTrader:
                 "tp_distance_pct": round(setup["tp_distance_pct"], 4),
                 "status": "OPEN",
                 "exit_time_utc": "",
+                "exit_time_est": "",
                 "exit_price": "",
                 "exit_reason": "",
                 "pnl_pct": "",
@@ -668,7 +853,7 @@ class OKXDummyTrader:
             open_symbols.add(symbol)
             opened += 1
             print(
-                f"[ENTRY] {symbol} {direction} entry={entry:.6f} sl={setup['sl_price']:.6f} "
+                f"[{est_now_iso()}] [ENTRY] {symbol} {direction} entry={entry:.6f} sl={setup['sl_price']:.6f} "
                 f"tp={setup['tp_price']:.6f} tp%={setup['tp_distance_pct']:.2f}"
             )
 
@@ -676,6 +861,9 @@ class OKXDummyTrader:
         if fail_counter:
             top_failed = ", ".join([f"{k}={v}" for k, v in fail_counter.most_common(6)])
             print(f"[SCAN] top_failed_checks: {top_failed}")
+        if non_evaluable_counter:
+            top_non_eval = ", ".join([f"{k}={v}" for k, v in non_evaluable_counter.most_common(6)])
+            print(f"[SCAN] non_evaluable_reasons: {top_non_eval}")
         
         self._write_diagnostics_row(
             evaluated=evaluated_count,
@@ -683,7 +871,9 @@ class OKXDummyTrader:
             opened=opened,
             non_evaluable=non_evaluable_count,
             fail_counter=fail_counter,
+            non_evaluable_counter=non_evaluable_counter,
         )
+        self._append_failure_rows(failure_rows)
         return trades
 
     def run_cycle(self) -> None:
@@ -695,7 +885,7 @@ class OKXDummyTrader:
 
         open_n = int((trades["status"] == "OPEN").sum())
         closed_n = int((trades["status"] == "CLOSED").sum())
-        print(f"[CYCLE {self.iteration}] open={open_n} closed={closed_n} total={len(trades)}")
+        print(f"[{est_now_iso()}] [CYCLE {self.iteration}] open={open_n} closed={closed_n} total={len(trades)}")
 
     def run(self, once: bool = False) -> None:
         print("=" * 70)
@@ -704,9 +894,12 @@ class OKXDummyTrader:
         print(f"log_file={self.log_file}")
         if self.diagnostics_file:
             print(f"diagnostics_file={self.diagnostics_file}")
+        if self.failure_log_file:
+            print(f"failure_log_file={self.failure_log_file}")
         print(f"interval_sec={self.interval_sec}")
         print(f"max_new_trades_per_cycle={self.max_new_trades_per_cycle}")
-        print(f"min_volume_5m={self.min_volume_5m}")
+        print(f"min_trade_count_5m={self.min_trade_count_5m} (Orion filter)")
+        print(f"min_volume_5m={self.min_volume_5m} (deprecated, not used)")
         print()
 
         if once:
@@ -731,7 +924,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--diagnostics-file", default="", help="CSV file to log per-cycle failure diagnostics")
     p.add_argument("--interval-sec", type=int, default=300)
     p.add_argument("--max-new-trades", type=int, default=2)
-    p.add_argument("--min-volume-5m", type=float, default=50000.0)
+    p.add_argument("--min-volume-5m", type=float, default=10000.0, help="(Deprecated) Now using Orion trade count")
+    p.add_argument("--min-trade-count-5m", type=int, default=1000, help="Min 5min trade count from Orion screener")
     p.add_argument("--once", action="store_true")
     return p.parse_args()
 
@@ -744,5 +938,6 @@ if __name__ == "__main__":
         max_new_trades_per_cycle=args.max_new_trades,
         min_volume_5m=args.min_volume_5m,
         diagnostics_file=args.diagnostics_file if args.diagnostics_file else None,
+        min_trade_count_5m=args.min_trade_count_5m,
     )
     bot.run(once=args.once)

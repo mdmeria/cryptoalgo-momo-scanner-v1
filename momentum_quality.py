@@ -27,6 +27,28 @@ class MomentumCheckConfig:
     """Feature flags for momentum checks to allow isolated tuning."""
 
     require_grind_subchecks_in_balanced_2h: bool = True
+    enforce_geometry_2h_gate: bool = False
+
+
+def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Simple ATR series (rolling mean of true range)."""
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    prev_close = close.shift(1)
+
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(period).mean()
 
 
 def _smma(values: pd.Series, length: int) -> pd.Series:
@@ -84,6 +106,52 @@ def _session_vwap(df: pd.DataFrame) -> float:
     return float((tp * vol).sum() / denom)
 
 
+def _nama(src: pd.Series, seed_len: int = 60) -> pd.Series:
+    """Port of Pine Script nama(): seed with SMA(seed_len), then slow EWM.
+
+    alpha = 1.618 / 100 = 0.01618 (fixed, independent of seed_len).
+    Equivalent to Pine Script:
+        nama(src, len) =>
+            alpha = 1.618 / 100
+            ma = ta.sma(src, len)
+            ma := na(ma[1]) ? ma : alpha * src + (1 - alpha) * ma[1]
+    """
+    alpha = 1.618 / 100.0
+    out = src.copy().astype(float)
+    sma_seed = src.rolling(seed_len).mean()
+    # Find first valid SMA position
+    first_valid = sma_seed.first_valid_index()
+    if first_valid is None:
+        return out * float("nan")
+    iloc_start = src.index.get_loc(first_valid)
+    out.iloc[:iloc_start] = float("nan")
+    out.iloc[iloc_start] = sma_seed.iloc[iloc_start]
+    for i in range(iloc_start + 1, len(src)):
+        out.iloc[i] = alpha * src.iloc[i] + (1.0 - alpha) * out.iloc[i - 1]
+    return out
+
+
+def _vol_usd_rising(df: pd.DataFrame, seed_len: int = 60, lookback: int = 10) -> bool:
+    """Return True when nama(volume*close, seed_len) is rising vs lookback bars ago.
+
+    Implements the Pine Script VolUsd gate:
+        vol = volume * close
+        ma  = nama(vol, len)   // very slow alpha=1.618/100
+        gate passes when ma > ma[lookback bars ago]
+    """
+    if len(df) < seed_len + lookback + 5:
+        return True  # not enough data — don't reject
+    vol_usd = df["volume"] * df["close"]
+    ma = _nama(vol_usd, seed_len=seed_len)
+    if ma.isna().all():
+        return True
+    ma_now = float(ma.iloc[-1])
+    ma_prev = float(ma.iloc[-(lookback + 1)])
+    if np.isnan(ma_now) or np.isnan(ma_prev):
+        return True
+    return ma_now > ma_prev
+
+
 def _linear_slope(values: pd.Series) -> float:
     """Return normalized slope per bar for the given series."""
     clean = values.dropna()
@@ -95,6 +163,112 @@ def _linear_slope(values: pd.Series) -> float:
         return 0.0
     slope, _ = np.polyfit(x, y, 1)
     return float(slope / max(abs(np.mean(y)), 1e-9))
+
+
+def _regression_r2(values: pd.Series) -> float:
+    """Return linear-regression R^2 for the series."""
+    clean = values.dropna()
+    if len(clean) < 5:
+        return 0.0
+    x = np.arange(len(clean), dtype=float)
+    y = clean.to_numpy(dtype=float)
+    if np.allclose(y, y[0]):
+        return 0.0
+    slope, intercept = np.polyfit(x, y, 1)
+    y_hat = intercept + slope * x
+    sse = float(np.sum((y - y_hat) ** 2))
+    sst = float(np.sum((y - float(np.mean(y))) ** 2))
+    if sst <= 1e-12:
+        return 0.0
+    r2 = 1.0 - (sse / sst)
+    return float(max(0.0, min(1.0, r2)))
+
+
+def _momentum_geometry_2h(df: pd.DataFrame, direction: str) -> tuple[bool, Dict[str, float]]:
+    """
+    Quantify 2h "clean momentum" geometry using slope + linearity + low noise.
+
+    This converts visual "~45 degree, low-noise" intuition into scale-invariant metrics.
+    """
+    if df is None or len(df) < 120:
+        return False, {
+            "geom_norm_slope_2h": 0.0,
+            "geom_r2_2h": 0.0,
+            "geom_er_2h": 0.0,
+            "geom_dir_consistency_2h": 0.0,
+            "geom_pullback_atr_2h": 999.0,
+            "geom_score_2h": 0.0,
+        }
+
+    is_long = direction.lower() == "long"
+    left = df.iloc[-120:].copy()
+    close = left["close"].astype(float)
+
+    atr_series = _atr(left, period=14)
+    atr_now = float(atr_series.iloc[-1]) if len(atr_series) > 0 else float("nan")
+    price_now = float(close.iloc[-1])
+
+    x = np.arange(len(close), dtype=float)
+    y = close.to_numpy(dtype=float)
+    if np.allclose(y, y[0]):
+        slope = 0.0
+    else:
+        slope, _ = np.polyfit(x, y, 1)
+
+    # Convert slope to ATR units per bar to make it robust across symbols.
+    norm_slope = 0.0
+    if np.isfinite(atr_now) and atr_now > 1e-9:
+        slope_signed = float(slope if is_long else -slope)
+        norm_slope = float(slope_signed / atr_now)
+
+    r2 = _regression_r2(close)
+
+    net_move_abs = abs(float(close.iloc[-1] - close.iloc[0]))
+    path = float(close.diff().abs().fillna(0.0).sum())
+    er = float(net_move_abs / max(path, 1e-9))
+
+    diff = close.diff().fillna(0.0)
+    dir_bars = int((diff > 0).sum()) if is_long else int((diff < 0).sum())
+    dir_consistency = float(dir_bars) / max(len(diff), 1)
+
+    # Worst counter-trend pullback from rolling extreme, normalized by ATR.
+    if is_long:
+        rolling_peak = close.cummax()
+        pullback = (rolling_peak - close).max()
+    else:
+        rolling_trough = close.cummin()
+        pullback = (close - rolling_trough).max()
+
+    pullback_atr = 999.0
+    if np.isfinite(atr_now) and atr_now > 1e-9:
+        pullback_atr = float(pullback / atr_now)
+
+    # Weights intentionally balanced between trend steepness, linearity, and noise control.
+    geom_score = (
+        0.30 * max(0.0, norm_slope)
+        + 0.25 * r2
+        + 0.25 * er
+        + 0.20 * dir_consistency
+        - 0.20 * min(2.0, max(0.0, pullback_atr))
+    )
+
+    # Permissive defaults for 2h 1m-bar windows; tune with your backtests.
+    geometry_ok = (
+        norm_slope >= 0.015
+        and r2 >= 0.55
+        and er >= 0.35
+        and dir_consistency >= 0.52
+        and pullback_atr <= 1.20
+    )
+
+    return geometry_ok, {
+        "geom_norm_slope_2h": float(norm_slope),
+        "geom_r2_2h": float(r2),
+        "geom_er_2h": float(er),
+        "geom_dir_consistency_2h": float(dir_consistency),
+        "geom_pullback_atr_2h": float(pullback_atr),
+        "geom_score_2h": float(geom_score),
+    }
 
 
 def _detect_counter_retracements(
@@ -277,7 +451,7 @@ def _balanced_momo_profile_2h(
         and 0.45 <= dir_bar_ratio <= 0.98
         and max_dir_impulse_8m <= 0.025
         and 0.12 <= efficiency <= 0.90
-        and regime_age_bars >= 5
+        and regime_age_bars >= 60
     )
 
     # Intentionally ignore periodic 2h grind subchecks.
@@ -325,7 +499,7 @@ def _price_parallel_to_smma30_2h(df: pd.DataFrame, direction: str) -> tuple[bool
     else:
         trend_side_ratio = float((state_filled <= 0).sum()) / max(len(state_filled), 1)
 
-    parallel_ok = cross_count <= 4 and trend_side_ratio >= 0.85
+    parallel_ok = cross_count <= 2 and trend_side_ratio >= 0.90
 
     return parallel_ok, {
         "smma30_crosses_2h": float(cross_count),
@@ -450,9 +624,8 @@ def _detect_regime_age_2h(df: pd.DataFrame, direction: str) -> tuple[int, bool]:
     
     age_in_bars = len(close) - 1 - regime_start_idx
     
-    # Much softer check: only reject if VERY fresh (<10 bars, ~10 minutes)
-    # User prefers 90+ but doesn't hard-reject fresh ones
-    passes = age_in_bars >= 10
+    # Require at least 60 bars (~1h) of established regime before entry.
+    passes = age_in_bars >= 60
     
     return age_in_bars, passes
 
@@ -566,7 +739,7 @@ def _pre_entry_directional_30m(df: pd.DataFrame, direction: str) -> tuple[bool, 
         dir_move_10m >= 0.0020
         and dir_bar_ratio_10m >= 0.60
         and 0.30 <= efficiency10 <= 0.95
-        and opp_candles_10m <= 4
+        and opp_candles_10m <= 3
     )
 
     # NEW: Spike concentration check
@@ -630,6 +803,7 @@ def evaluate_momentum_setup(
                 "balanced_momo_2h": False,
                 "parallel_to_smma30_2h": False,
                 "smma_spread_increasing_2h": False,
+                "momentum_geometry_2h": False,
             },
             metrics={"bars": float(len(df) if df is not None else 0)},
         )
@@ -640,7 +814,6 @@ def evaluate_momentum_setup(
     work = df.copy()
     work["smma30"] = _smma(work["close"], 30)
     work["smma120"] = _smma(work["close"], 120)
-    work["vol_ma20"] = work["volume"].rolling(20).mean()
 
     # Rule 1: Approach quality (last ~10 bars should grind in the signal direction)
     approach = work.iloc[-10:]
@@ -683,10 +856,10 @@ def evaluate_momentum_setup(
             and float(left["close"].iloc[-1]) < float(left["smma30"].iloc[-1])
         )
 
-    # Rule 3: Volume profile should not be clearly decaying
-    vol_slice = work["vol_ma20"].iloc[-30:]
-    vol_slope = _linear_slope(vol_slice)
-    volume_ok = vol_slope > -0.02
+    # Rule 3: VolUsd MA (nama, alpha=1.618/100) must be rising vs 10 bars ago.
+    # Implements the Pine Script VolUsd indicator: vol=volume*close, ma=nama(vol,60),
+    # gate passes when ma > ma[10 bars ago].
+    volume_ok = _vol_usd_rising(work, seed_len=60, lookback=10)
 
     # Rule 5: 2h profile should be between sideways and spike behavior.
     balanced_momo_2h, balanced_metrics = _balanced_momo_profile_2h(
@@ -703,10 +876,13 @@ def evaluate_momentum_setup(
         smma30_slope=smma30_slope,
         smma30_crosses_2h=parallel_metrics["smma30_crosses_2h"],
     )
-    not_choppy = noise_class_momentum != "high"
+    not_choppy = noise_class_momentum == "low"
 
     # Rule 7: Distance between 30SMMA and 120SMMA should gradually increase.
     smma_spread_increasing_2h, spread_metrics = _smma_spread_slowly_increasing_2h(work, side)
+
+    # Rule 8: Geometric trend quality over full 2h (slope + linearity + low noise).
+    momentum_geometry_2h, geometry_metrics = _momentum_geometry_2h(work, side)
 
     checks = {
         "enough_data": True,
@@ -718,6 +894,7 @@ def evaluate_momentum_setup(
         "balanced_momo_2h": balanced_momo_2h,
         "parallel_to_smma30_2h": parallel_to_smma30_2h,
         "smma_spread_increasing_2h": smma_spread_increasing_2h,
+        "momentum_geometry_2h": momentum_geometry_2h,
         "day_change_ok": True,
         "vwap_side_ok": True,
         "first_2h_prev_day_vwap_ok": True,
@@ -849,6 +1026,7 @@ def evaluate_momentum_setup(
         and checks["parallel_to_smma30_2h"]
         and checks["smma_spread_increasing_2h"]
         and score >= min_quality_score
+        and ((not cfg.enforce_geometry_2h_gate) or checks["momentum_geometry_2h"])
     )
 
     # Hard requirement: left-side staircase must be present for 2h context.
@@ -895,7 +1073,7 @@ def evaluate_momentum_setup(
         "smma120_slope": float(smma120_slope),
         "staircase_bars_120": float(staircase_bars),
         "trend_stack_bars_120": float(trend_stack_bars),
-        "vol_slope": float(vol_slope),
+        "vol_usd_rising": float(1 if volume_ok else 0),
         "smma_side_changes_60": float(parallel_metrics["smma30_crosses_2h"]),
         "smma30_direction_2h": 1.0 if smma30_direction_2h == "up" else (-1.0 if smma30_direction_2h == "down" else 0.0),
         "noise_class_momentum": 0.0 if noise_class_momentum == "low" else (1.0 if noise_class_momentum == "medium" else 2.0),
@@ -921,7 +1099,14 @@ def evaluate_momentum_setup(
         "smma30_trend_side_ratio_2h": float(parallel_metrics["smma30_trend_side_ratio_2h"]),
         "smma_spread_slope_2h": float(spread_metrics["smma_spread_slope_2h"]),
         "smma_spread_up_ratio_2h": float(spread_metrics["smma_spread_up_ratio_2h"]),
+        "geom_norm_slope_2h": float(geometry_metrics["geom_norm_slope_2h"]),
+        "geom_r2_2h": float(geometry_metrics["geom_r2_2h"]),
+        "geom_er_2h": float(geometry_metrics["geom_er_2h"]),
+        "geom_dir_consistency_2h": float(geometry_metrics["geom_dir_consistency_2h"]),
+        "geom_pullback_atr_2h": float(geometry_metrics["geom_pullback_atr_2h"]),
+        "geom_score_2h": float(geometry_metrics["geom_score_2h"]),
         "grind_subchecks_enabled": float(1 if cfg.require_grind_subchecks_in_balanced_2h else 0),
+        "geometry_2h_gate_enabled": float(1 if cfg.enforce_geometry_2h_gate else 0),
     }
 
     return MomentumQualityResult(
