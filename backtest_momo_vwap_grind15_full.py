@@ -1037,6 +1037,170 @@ class TradeRecord:
     exit_price: float
     pnl_pct: float
     skip_gate: str = ""
+    dps_total: int = 0
+    dps_confidence: str = "avoid"
+    dps_v1_duration: int = 0
+    dps_v2_approach: int = 0
+    dps_v3_volume: int = 0
+    approach_label: str = ""
+    vol_trend: str = ""
+    duration_hrs: float = 0.0
+
+
+def check_momo_gates_at_bar(df_slice: pd.DataFrame, side: str,
+                            cfg: GateSettings) -> dict:
+    """
+    Run all momentum gates on a single bar/slice for a given side.
+    Returns dict with 'passed', 'reason' (if failed), and 'entry'/'sl'/'tp'
+    plus DPS scoring if passed.
+
+    This is the shared gate logic used by both backtest and live trader.
+    """
+    is_long = side == "long"
+
+    # --- Global gates ---
+    if cfg.enable_volusd_gate and not gate_volusd(df_slice):
+        return {"passed": False, "reason": "volusd_falling"}
+    if not gate_vol_usd_5m(df_slice, cfg):
+        return {"passed": False, "reason": "vol_usd_5m_low"}
+    if cfg.enable_30m_noise_gate and not gate_30m_noise(df_slice, cfg):
+        return {"passed": False, "reason": "30m_noise"}
+    if cfg.enable_5m_antispike_gate and not gate_5m_antispike(df_slice, cfg):
+        return {"passed": False, "reason": "5m_spike"}
+
+    # --- Side-specific gates ---
+    if cfg.enable_regime_breakout_gate:
+        passed, reason = gate_regime_breakout(df_slice, side, cfg)
+        if not passed:
+            return {"passed": False, "reason": f"regime_{side}"}
+
+    if cfg.entry_not_crossed_6h:
+        if not gate_entry_not_crossed_6h(df_slice, side):
+            return {"passed": False, "reason": f"not_crossed_6h_{side}"}
+
+    if cfg.enable_10m_gate:
+        passed, reason = gate_10m_directional(df_slice, side, cfg)
+        if not passed:
+            return {"passed": False, "reason": f"10m_{side}"}
+
+    if cfg.enable_vwap_side_gate:
+        if not gate_vwap_side(df_slice, side):
+            return {"passed": False, "reason": f"vwap_{side}"}
+
+    if cfg.enable_ema7_cross_gate:
+        passed, reason = gate_ema7_cross(df_slice, side, cfg)
+        if not passed:
+            return {"passed": False, "reason": f"ema7_{side}"}
+
+    if cfg.enable_staircase_gate:
+        passed, reason = gate_staircase_quality(df_slice, side, cfg)
+        if not passed:
+            return {"passed": False, "reason": f"staircase_{side}"}
+
+    if cfg.enable_last15m_gate:
+        passed, reason = gate_last15m(df_slice, side, cfg)
+        if not passed:
+            return {"passed": False, "reason": f"last15m_{side}"}
+
+    if cfg.enable_2h_gate:
+        passed, reason = gate_smma_trend(df_slice, side, cfg)
+        if not passed:
+            return {"passed": False, "reason": f"2h_{side}"}
+
+    # --- All gates passed — compute SL/TP ---
+    entry_price = float(df_slice["close"].iloc[-1])
+    entry, sl, tp = compute_sl_tp(df_slice, side, cfg, entry_price=entry_price)
+
+    if cfg.enable_rr_guard:
+        rr_ok, eff_rr = rr_guard(entry, sl, tp, side)
+        if not rr_ok:
+            return {"passed": False, "reason": f"rr={eff_rr:.2f}"}
+    else:
+        _, eff_rr = rr_guard(entry, sl, tp, side)
+
+    if cfg.enable_min_tp_sl_pct_gate:
+        if not min_tp_sl_gate(entry, sl, tp, side, cfg.min_profit_pct):
+            return {"passed": False, "reason": "min_tp_sl"}
+
+    # --- SL/TP percentages ---
+    if is_long:
+        sl_pct = (entry - sl) / entry * 100.0
+        tp_pct = (tp - entry) / entry * 100.0
+    else:
+        sl_pct = (sl - entry) / entry * 100.0
+        tp_pct = (entry - tp) / entry * 100.0
+
+    # --- DPS scoring ---
+    closes_arr = df_slice["close"].values
+
+    # V1: Duration
+    smma30_arr = pd.Series(closes_arr).ewm(alpha=1.0 / 30, adjust=False).mean().values
+    streak = 0
+    for j in range(len(closes_arr) - 1, -1, -1):
+        if is_long and closes_arr[j] > smma30_arr[j]:
+            streak += 1
+        elif not is_long and closes_arr[j] < smma30_arr[j]:
+            streak += 1
+        else:
+            break
+    dur_hrs = streak / 60.0
+    dps_v1 = 2 if dur_hrs >= 4 else (1 if dur_hrs >= 2 else 0)
+
+    # V2: Approach
+    approach_bars = closes_arr[-10:]
+    if len(approach_bars) >= 10:
+        net = (approach_bars[-1] - approach_bars[0]) / abs(approach_bars[0]) if approach_bars[0] != 0 else 0
+        diffs = np.diff(approach_bars)
+        opposite = int(np.sum(diffs < 0)) if is_long else int(np.sum(diffs > 0))
+        grind_ok = (net > 0 if is_long else net < 0) and opposite <= 3
+        if grind_ok:
+            dps_v2, approach_lbl = 2, "grind"
+        elif opposite <= 5:
+            dps_v2, approach_lbl = 1, "unclear"
+        else:
+            dps_v2, approach_lbl = 0, "spike"
+    else:
+        dps_v2, approach_lbl = 0, "spike"
+
+    # V3: Volume
+    vol_usd = df_slice["volume"].values * closes_arr
+    vol_ma = pd.Series(vol_usd).ewm(alpha=1.618 / 100, adjust=False).mean().values
+    vol_now = float(vol_ma[-1])
+    vol_prev = float(vol_ma[-11]) if len(vol_ma) > 11 else vol_now
+    vol_ratio = vol_now / vol_prev if vol_prev > 0 else 1.0
+    if vol_ratio > 1.05:
+        vol_trend_lbl = "increasing"
+    elif vol_ratio < 0.95:
+        vol_trend_lbl = "decreasing"
+    else:
+        vol_trend_lbl = "flat"
+
+    if is_long:
+        dps_v3 = 2 if vol_trend_lbl == "increasing" else (1 if vol_trend_lbl == "flat" else 0)
+    else:
+        dps_v3 = 2 if vol_trend_lbl == "increasing" else (1 if vol_trend_lbl == "decreasing" else 0)
+
+    dps_total = dps_v1 + dps_v2 + dps_v3
+    dps_conf = "max" if dps_total >= 6 else ("high" if dps_total >= 4 else ("low" if dps_total >= 3 else "avoid"))
+
+    return {
+        "passed": True,
+        "side": side,
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "sl_pct": round(sl_pct, 3),
+        "tp_pct": round(tp_pct, 3),
+        "rr": round(eff_rr, 2),
+        "dps_total": dps_total,
+        "dps_confidence": dps_conf,
+        "dps_v1": dps_v1,
+        "dps_v2": dps_v2,
+        "dps_v3": dps_v3,
+        "approach": approach_lbl,
+        "vol_trend": vol_trend_lbl,
+        "duration_hrs": round(dur_hrs, 2),
+    }
 
 
 def scan_symbol(
@@ -1182,6 +1346,72 @@ def scan_symbol(
                 tp_pct = (entry - tp) / entry * 100.0
                 pnl_pct = (entry - exit_price) / entry * 100.0 if outcome != "SL" else -sl_pct
 
+            # --- ZCT DPS Scoring for Momentum ---
+            closes_arr = df["close"].values[:entry_iloc + 1]
+            is_long = side == "long"
+
+            # V1: Staircase Duration — how long price stayed on right side of SMMA30
+            smma30_arr = pd.Series(closes_arr).ewm(alpha=1.0 / 30, adjust=False).mean().values
+            streak = 0
+            for j in range(len(closes_arr) - 1, -1, -1):
+                if is_long and closes_arr[j] > smma30_arr[j]:
+                    streak += 1
+                elif not is_long and closes_arr[j] < smma30_arr[j]:
+                    streak += 1
+                else:
+                    break
+            dur_hrs = streak / 60.0
+            dps_v1 = 2 if dur_hrs >= 4 else (1 if dur_hrs >= 2 else 0)
+
+            # V2: Approach — Spike=0, Unclear=1, Grind=2
+            # Check last 10 bars for slow grind approach
+            approach_bars = closes_arr[-10:]
+            if len(approach_bars) >= 10:
+                net = (approach_bars[-1] - approach_bars[0]) / abs(approach_bars[0]) if approach_bars[0] != 0 else 0
+                diffs = np.diff(approach_bars)
+                if is_long:
+                    opposite = int(np.sum(diffs < 0))
+                    grind_ok = net > 0 and opposite <= 3
+                else:
+                    opposite = int(np.sum(diffs > 0))
+                    grind_ok = net < 0 and opposite <= 3
+                if grind_ok:
+                    dps_v2 = 2
+                    approach_lbl = "grind"
+                elif opposite <= 5:
+                    dps_v2 = 1
+                    approach_lbl = "unclear"
+                else:
+                    dps_v2 = 0
+                    approach_lbl = "spike"
+            else:
+                dps_v2 = 0
+                approach_lbl = "spike"
+
+            # V3: Volume trend
+            vol_usd = df["volume"].values[:entry_iloc + 1] * closes_arr
+            vol_ma = pd.Series(vol_usd).ewm(alpha=1.618 / 100, adjust=False).mean().values
+            vol_now = float(vol_ma[-1])
+            vol_prev = float(vol_ma[-11]) if len(vol_ma) > 11 else vol_now
+            vol_ratio = vol_now / vol_prev if vol_prev > 0 else 1.0
+
+            if vol_ratio > 1.05:
+                vol_trend_lbl = "increasing"
+            elif vol_ratio < 0.95:
+                vol_trend_lbl = "decreasing"
+            else:
+                vol_trend_lbl = "flat"
+
+            # Momo Long:  Decreasing=0, Flat=1, Increasing=2
+            # Momo Short: Flat=0, Decreasing=1, Increasing=2
+            if is_long:
+                dps_v3 = 2 if vol_trend_lbl == "increasing" else (1 if vol_trend_lbl == "flat" else 0)
+            else:
+                dps_v3 = 2 if vol_trend_lbl == "increasing" else (1 if vol_trend_lbl == "decreasing" else 0)
+
+            dps_total = dps_v1 + dps_v2 + dps_v3
+            dps_conf = "max" if dps_total >= 6 else ("high" if dps_total >= 4 else ("low" if dps_total >= 3 else "avoid"))
+
             trades.append(TradeRecord(
                 symbol=symbol,
                 timestamp=str(df.index[entry_iloc]),
@@ -1196,6 +1426,14 @@ def scan_symbol(
                 bars_held=bars_held,
                 exit_price=exit_price,
                 pnl_pct=round(pnl_pct, 3),
+                dps_total=dps_total,
+                dps_confidence=dps_conf,
+                dps_v1_duration=dps_v1,
+                dps_v2_approach=dps_v2,
+                dps_v3_volume=dps_v3,
+                approach_label=approach_lbl,
+                vol_trend=vol_trend_lbl,
+                duration_hrs=round(dur_hrs, 2),
             ))
             last_trade_bar = entry_iloc
             trade_found = True
@@ -1408,6 +1646,37 @@ def main():
         print(f"\nGATE FAIL COUNTS (bars rejected per gate):")
         for gate, count in sorted(total_gate_fails.items(), key=lambda x: -x[1]):
             print(f"  {gate:<20}: {count:>8}")
+
+    # --- ZCT DPS Breakdown ---
+    if all_trades:
+        print(f"\n{'='*60}")
+        print(f"ZCT DPS EVALUATION")
+        print(f"{'='*60}")
+
+        def _dps_group(records, label, group_fn):
+            groups = {}
+            for t in records:
+                key = group_fn(t)
+                groups.setdefault(key, []).append(t)
+            print(f"\n--- By {label} ---")
+            print(f"  {'Key':>12s}  {'Trades':>6s}  {'TP':>4s}  {'SL':>4s}  {'WR%':>6s}  {'TotPnL':>8s}  {'AvgPnL':>8s}")
+            print("  " + "-" * 56)
+            for key in sorted(groups.keys()):
+                recs = groups[key]
+                tp_n = sum(1 for r in recs if r.outcome == "TP")
+                sl_n = sum(1 for r in recs if r.outcome == "SL")
+                closed = tp_n + sl_n
+                wr = tp_n / closed * 100 if closed > 0 else 0
+                tot_pnl = sum(r.pnl_pct for r in recs)
+                avg_pnl = tot_pnl / len(recs)
+                print(f"  {str(key):>12s}  {len(recs):>6d}  {tp_n:>4d}  {sl_n:>4d}  {wr:>5.1f}%  {tot_pnl:>+7.2f}%  {avg_pnl:>+7.3f}%")
+
+        _dps_group(all_trades, "DPS Score", lambda t: str(t.dps_total))
+        _dps_group(all_trades, "DPS Confidence", lambda t: t.dps_confidence)
+        _dps_group(all_trades, "Approach", lambda t: t.approach_label)
+        _dps_group(all_trades, "Volume Trend", lambda t: t.vol_trend)
+        _dps_group(all_trades, "Duration", lambda t: f"{t.duration_hrs:.0f}h" if t.duration_hrs < 10 else "10h+")
+        _dps_group(all_trades, "Side", lambda t: t.side)
 
 
 if __name__ == "__main__":

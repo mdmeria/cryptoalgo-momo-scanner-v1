@@ -50,18 +50,15 @@ from live_data_collector import (
 )
 from scan_mean_reversion import (
     MRSettings,
-    detect_choppy_range,
-    detect_pre_chop_trend,
-    detect_range_entry,
-    count_level_touches,
-    check_opposite_bound_intact,
-    compute_vwap_bands,
-    compute_sl_tp,
-    check_vwap_clear_path,
-    classify_noise,
-    evaluate_dps,
+    check_mr_gates_at_bar,
 )
-from momentum_quality import evaluate_momentum_setup
+from backtest_momo_vwap_grind15_full import (
+    GateSettings as MomoGateSettings,
+    check_momo_gates_at_bar,
+)
+
+# Load momentum gate config (same as backtest)
+_momo_gate_cfg = MomoGateSettings.from_json("momo_gate_settings.json")
 from depth_tp_sl_analyzer import compute_depth_tp_sl
 
 import requests
@@ -272,96 +269,21 @@ def detect_mr_setup_live(df: pd.DataFrame, symbol: str,
                           cfg: MRSettings) -> Optional[dict]:
     """
     Check if the LATEST bar has an MR setup.
-    Adapts scan_symbol() to check only the last bar.
+    Uses the shared check_mr_gates_at_bar() for identical logic
+    between backtest and live trading.
     """
     if len(df) < max(cfg.range_max_bars, cfg.noise_lookback_bars, 720) + 10:
         return None
 
     df = df.sort_values("timestamp").reset_index(drop=True)
-    closes = df["close"].values
-    highs = df["high"].values
-    lows = df["low"].values
-    opens = df["open"].values
-
     i = len(df) - 1  # Latest bar
 
-    # Step 1: Detect choppy range
-    range_info = detect_choppy_range(highs, lows, closes, i, cfg)
-    if range_info is None:
+    result = check_mr_gates_at_bar(df, i, cfg)
+    if not result["passed"]:
         return None
-
-    # Step 2: Pre-chop trend
-    pre_trend = detect_pre_chop_trend(closes, range_info["start_idx"])
-
-    # Step 3: Entry at range boundary
-    entry_info = detect_range_entry(df, i, range_info, cfg)
-    if entry_info is None:
-        return None
-
-    # Filter: side must match pre-chop trend
-    if pre_trend["preferred_side"] is not None:
-        if entry_info["side"] != pre_trend["preferred_side"]:
-            return None
-
-    # Step 4: Touch counting + level integrity
-    entry_side = entry_info["level_side"]
-    touches = count_level_touches(
-        highs, lows, closes, opens,
-        range_info["start_idx"], i,
-        entry_info["level_price"], entry_side,
-        debounce_bars=cfg.touch_cluster_bars,
-    )
-
-    if touches["count"] < cfg.min_touches:
-        return None
-    if touches["break_pct"] > 5.0:
-        return None
-
-    # Step 5: Last touch recency
-    if touches["last_touch_idx"] < 0:
-        return None
-    bars_since_last = i - touches["last_touch_idx"]
-    if bars_since_last > cfg.last_touch_max_bars:
-        return None
-
-    # Step 5b: Opposite boundary check
-    opp_check = check_opposite_bound_intact(
-        highs, lows, closes,
-        touches["last_touch_idx"], i,
-        range_info, entry_side)
-    if not opp_check["opposite_intact"]:
-        return None
-
-    # Step 5c: Post-touch trend contradiction
-    if opp_check["post_touch_trend"] == "bearish" and entry_info["side"] == "long":
-        return None
-    if opp_check["post_touch_trend"] == "bullish" and entry_info["side"] == "short":
-        return None
-
-    # Step 6: VWAP bands
-    vwap_info = compute_vwap_bands(df, i)
-
-    # Step 7: SL/TP
-    sl_tp = compute_sl_tp(df, i, entry_info["entry_price"],
-                          entry_info["side"], range_info, vwap_info, cfg)
-    if sl_tp is None:
-        return None
-
-    # Step 8: VWAP clear path
-    vwap_check = check_vwap_clear_path(
-        entry_info["entry_price"], sl_tp["tp"],
-        entry_info["side"], vwap_info)
-    if not vwap_check["vwap_clear"]:
-        return None
-
-    # Step 9: Noise
-    noise = classify_noise(closes, i, cfg)
-
-    # Step 10: DPS scoring
-    dps = evaluate_dps(df, i, range_info, entry_info, cfg)
 
     # Only take DPS >= 3 (low confidence and above)
-    if dps["dps_total"] < 3:
+    if result["dps_total"] < 3:
         return None
 
     entry_ts = str(df.iloc[i]["timestamp"])
@@ -370,23 +292,26 @@ def detect_mr_setup_live(df: pd.DataFrame, symbol: str,
         "symbol": symbol,
         "strategy": "mean_reversion",
         "timestamp": entry_ts,
-        "side": entry_info["side"],
-        "entry": round(entry_info["entry_price"], 8),
-        "sl": sl_tp["sl"],
-        "tp": sl_tp["tp"],
-        "sl_pct": sl_tp["sl_pct"],
-        "tp_pct": sl_tp["tp_pct"],
-        "rr": sl_tp["rr"],
-        "dps_total": dps["dps_total"],
-        "dps_confidence": dps["dps_confidence"],
-        "noise_level": noise["noise_level"],
-        "touches": touches["count"],
-        "break_pct": touches["break_pct"],
-        "range_width_pct": range_info["width_pct"],
-        "range_duration_hrs": range_info["duration_hrs"],
-        "pre_chop_trend": pre_trend["trend"],
-        "approach": dps["dps_v2_label"],
-        "vol_trend": dps["dps_v3_vol_trend"],
+        "side": result["side"],
+        "entry": result["entry"],
+        "sl": result["sl"],
+        "tp": result["tp"],
+        "sl_pct": result["sl_pct"],
+        "tp_pct": result["tp_pct"],
+        "rr": result["rr"],
+        "dps_total": result["dps_total"],
+        "dps_confidence": result["dps_confidence"],
+        "noise_level": result["noise_level"],
+        "touches": result["touches"],
+        "break_pct": result["break_pct"],
+        "range_width_pct": result["range_width_pct"],
+        "range_duration_hrs": result["range_duration_hrs"],
+        "pre_chop_trend": result["pre_chop_trend"],
+        "approach": result["dps_v2_label"],
+        "vol_trend": result["dps_v3_vol_trend"],
+        "range_upper": result["range_upper"],
+        "range_lower": result["range_lower"],
+        "touch_timestamps": result["touch_timestamps"],
     }
 
 
@@ -398,119 +323,29 @@ def detect_momo_setup_live(df: pd.DataFrame, symbol: str) -> Optional[dict]:
     """
     Check if the LATEST bars show a momentum setup.
 
-    Uses evaluate_momentum_setup() for quality validation.
-    Entry trigger: price breaking above/below recent 2h high/low
-    with clean staircase structure behind it.
+    Uses the same gate-based system as the backtest (check_momo_gates_at_bar)
+    to ensure identical trade detection between backtest and live.
+    DPS scoring is computed inside the shared gate function.
     """
-    if len(df) < 370:
+    if len(df) < 500:
         return None
 
     df = df.sort_values("timestamp").reset_index(drop=True)
-    closes = df["close"].values
-    highs = df["high"].values
-    lows = df["low"].values
-    current_close = float(closes[-1])
 
-    # Check both directions
+    # Need timestamp-indexed DataFrame for the gate functions
+    df_indexed = df.set_index("timestamp").copy()
+    df_indexed.index = pd.to_datetime(df_indexed.index, utc=True)
+
+    # Check both directions using the shared gate system
     for direction in ["long", "short"]:
-        is_long = direction == "long"
+        result = check_momo_gates_at_bar(df_indexed, direction, _momo_gate_cfg)
 
-        # Entry trigger: price at/near 2h high (long) or 2h low (short)
-        window_2h = 120
-        recent_highs = highs[-window_2h:]
-        recent_lows = lows[-window_2h:]
-        recent_high = float(np.max(recent_highs))
-        recent_low = float(np.min(recent_lows))
-
-        if is_long:
-            # Price should be within 0.1% of 2h high (breaking out)
-            dist_to_high = (recent_high - current_close) / current_close * 100
-            if dist_to_high > 0.1:
-                continue
-        else:
-            # Price should be within 0.1% of 2h low
-            dist_to_low = (current_close - recent_low) / current_close * 100
-            if dist_to_low > 0.1:
-                continue
-
-        # Run quality evaluation
-        result = evaluate_momentum_setup(
-            df, direction,
-            min_quality_score=0.60,
-            symbol=None,  # skip extended rules (no Binance fetch)
-            enforce_extended_rules=False,
-        )
-
-        if not result.passed:
+        if not result["passed"]:
             continue
 
-        # Compute TP/SL using momo gate settings
-        entry_price = current_close
-
-        # SL: below recent swing low (long) or above recent swing high (short)
-        atr_window = min(120, len(df) - 1)
-        atr_vals = []
-        for j in range(-atr_window, 0):
-            tr = max(
-                highs[j] - lows[j],
-                abs(highs[j] - closes[j - 1]),
-                abs(lows[j] - closes[j - 1]),
-            )
-            atr_vals.append(tr)
-        atr = np.mean(atr_vals) if atr_vals else 0
-
-        if is_long:
-            # SL below recent swing low
-            swing_low = float(np.min(lows[-30:]))
-            sl = min(swing_low * 0.999, entry_price * (1 - 1.5 / 100))
-            sl = max(sl, entry_price * (1 - 2.0 / 100))  # cap at 2%
-            sl_pct = (entry_price - sl) / entry_price * 100
-
-            # TP with RR >= 1.1
-            tp_pct = max(sl_pct * 1.1, 1.0)  # min 1% TP
-            tp = entry_price * (1 + tp_pct / 100)
-        else:
-            swing_high = float(np.max(highs[-30:]))
-            sl = max(swing_high * 1.001, entry_price * (1 + 1.5 / 100))
-            sl = min(sl, entry_price * (1 + 2.0 / 100))  # cap at 2%
-            sl_pct = (sl - entry_price) / entry_price * 100
-
-            tp_pct = max(sl_pct * 1.1, 1.0)
-            tp = entry_price * (1 - tp_pct / 100)
-
-        rr = tp_pct / sl_pct if sl_pct > 0 else 0
-
-        if tp_pct < 1.0 or rr < 1.0:
+        # DPS filter: only take DPS >= 3
+        if result["dps_total"] < 3:
             continue
-
-        # DPS scoring for momentum
-        # V1: Staircase duration
-        smma30 = pd.Series(closes).ewm(alpha=1.0 / 30, adjust=False).mean().values
-        # Count how long price has been on the right side of SMMA30
-        streak = 0
-        for j in range(len(closes) - 1, -1, -1):
-            if is_long and closes[j] > smma30[j]:
-                streak += 1
-            elif not is_long and closes[j] < smma30[j]:
-                streak += 1
-            else:
-                break
-        duration_hrs = streak / 60
-        v1 = 2 if duration_hrs >= 4 else (1 if duration_hrs >= 2 else 0)
-
-        # V2: Approach (use quality tier)
-        v2 = 2 if result.quality_tier == "high" else 1
-
-        # V3: Volume - check nama trend
-        vol_series = pd.Series(df["volume"].values * closes)
-        vol_ma = vol_series.ewm(alpha=1.618 / 100, adjust=False).mean()
-        v3 = 2 if float(vol_ma.iloc[-1]) > float(vol_ma.iloc[-11]) else 0
-
-        dps_total = v1 + v2 + v3
-        if dps_total < 3:
-            continue
-
-        dps_conf = "max" if dps_total >= 6 else ("high" if dps_total >= 4 else "low")
 
         entry_ts = str(df.iloc[-1]["timestamp"])
 
@@ -519,19 +354,17 @@ def detect_momo_setup_live(df: pd.DataFrame, symbol: str) -> Optional[dict]:
             "strategy": "momentum",
             "timestamp": entry_ts,
             "side": direction,
-            "entry": round(entry_price, 8),
-            "sl": round(sl, 8),
-            "tp": round(tp, 8),
-            "sl_pct": round(sl_pct, 3),
-            "tp_pct": round(tp_pct, 3),
-            "rr": round(rr, 2),
-            "dps_total": dps_total,
-            "dps_confidence": dps_conf,
-            "noise_level": "low" if result.checks.get("not_choppy") else "medium",
-            "quality_tier": result.quality_tier,
-            "quality_score": round(result.score, 3),
-            "checks_passed": sum(1 for v in result.checks.values() if v),
-            "checks_total": len(result.checks),
+            "entry": round(result["entry"], 8),
+            "sl": round(result["sl"], 8),
+            "tp": round(result["tp"], 8),
+            "sl_pct": result["sl_pct"],
+            "tp_pct": result["tp_pct"],
+            "rr": result["rr"],
+            "dps_total": result["dps_total"],
+            "dps_confidence": result["dps_confidence"],
+            "approach": result["approach"],
+            "vol_trend": result["vol_trend"],
+            "duration_hrs": result["duration_hrs"],
         }
 
     return None
@@ -758,7 +591,11 @@ def trading_cycle(pos_mgr: PositionManager, mr_cfg: MRSettings,
             stats["mr_setups"] += 1
 
             # Determine position size
-            risk_pct = STANDARD_RISK_PCT if mr_setup["dps_confidence"] in ("max", "high") else DUMMY_RISK_PCT
+            # Force dummy trade if pre-chop trend is unclear (no directional conviction)
+            if mr_setup.get("pre_chop_trend") == "unclear":
+                risk_pct = DUMMY_RISK_PCT
+            else:
+                risk_pct = STANDARD_RISK_PCT if mr_setup["dps_confidence"] in ("max", "high") else DUMMY_RISK_PCT
             position_usd = DUMMY_BALANCE * risk_pct / 100
 
             mr_setup["position_usd"] = round(position_usd, 2)
@@ -857,8 +694,8 @@ def main():
                         help="Seconds between cycles (default: 60)")
     parser.add_argument("--min-vol", type=float, default=200_000,
                         help="Min 5-minute volume (default: 200000)")
-    parser.add_argument("--top-n", type=int, default=30,
-                        help="Max coins to scan (default: 30)")
+    parser.add_argument("--top-n", type=int, default=60,
+                        help="Max coins to scan (default: 60)")
     parser.add_argument("--once", action="store_true",
                         help="Run one cycle and exit")
     parser.add_argument("--status", action="store_true",

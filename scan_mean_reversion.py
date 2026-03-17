@@ -803,6 +803,149 @@ def compute_sl_tp(df: pd.DataFrame, entry_idx: int, entry_price: float,
 
 
 # ---------------------------------------------------------------------------
+# Shared gate function — used by both backtest and live trader
+# ---------------------------------------------------------------------------
+
+def check_mr_gates_at_bar(df: pd.DataFrame, bar_idx: int,
+                          cfg: MRSettings) -> dict:
+    """
+    Run all MR gates on a single bar. Returns a result dict with:
+      - passed: bool
+      - reason: str (why it failed, or 'all_gates_passed')
+      - All setup fields (entry, sl, tp, dps, touches, etc.) if passed
+
+    This is the single source of truth for MR detection logic,
+    used by both scan_symbol() (backtest) and detect_mr_setup_live().
+    """
+    closes = df["close"].values
+    highs = df["high"].values
+    lows = df["low"].values
+    opens = df["open"].values
+    i = bar_idx
+
+    # Step 1: Detect choppy range
+    range_info = detect_choppy_range(highs, lows, closes, i, cfg)
+    if range_info is None:
+        return {"passed": False, "reason": "no_range"}
+
+    # Step 2: Pre-chop trend
+    pre_trend = detect_pre_chop_trend(closes, range_info["start_idx"])
+
+    # Step 3: Entry at range boundary
+    entry_info = detect_range_entry(df, i, range_info, cfg)
+    if entry_info is None:
+        return {"passed": False, "reason": "no_entry_trigger"}
+
+    # Filter: side must match pre-chop trend direction
+    if pre_trend["preferred_side"] is not None:
+        if entry_info["side"] != pre_trend["preferred_side"]:
+            return {"passed": False, "reason": "side_vs_pre_trend"}
+
+    # Filter: SMMA 30/120 trend — don't trade against the higher-timeframe trend
+    smma30 = pd.Series(closes[:i+1]).ewm(alpha=1.0 / 30, adjust=False).mean().values
+    smma120 = pd.Series(closes[:i+1]).ewm(alpha=1.0 / 120, adjust=False).mean().values
+    window = min(120, i)
+    smma30_slope = (smma30[-1] - smma30[-window]) / smma30[-window] * 100 if window > 0 else 0
+    smma120_slope = (smma120[-1] - smma120[-window]) / smma120[-window] * 100 if window > 0 else 0
+    if smma30_slope > 0 and smma120_slope > 0 and entry_info["side"] == "short":
+        return {"passed": False, "reason": "smma_trend_up_vs_short"}
+    if smma30_slope < 0 and smma120_slope < 0 and entry_info["side"] == "long":
+        return {"passed": False, "reason": "smma_trend_down_vs_long"}
+
+    # Step 4: Touch counting + level integrity
+    entry_side = entry_info["level_side"]
+    touches = count_level_touches(
+        highs, lows, closes, opens,
+        range_info["start_idx"], i,
+        entry_info["level_price"], entry_side,
+        debounce_bars=cfg.touch_cluster_bars,
+    )
+
+    if touches["count"] < cfg.min_touches:
+        return {"passed": False, "reason": f"touches_{touches['count']}_lt_{cfg.min_touches}"}
+    if touches["break_pct"] > 5.0:
+        return {"passed": False, "reason": "break_pct_too_high"}
+
+    # Step 5: Last touch recency
+    if touches["last_touch_idx"] < 0:
+        return {"passed": False, "reason": "no_last_touch"}
+    bars_since_last = i - touches["last_touch_idx"]
+    if bars_since_last > cfg.last_touch_max_bars:
+        return {"passed": False, "reason": "last_touch_too_old"}
+
+    # Step 5b: Opposite boundary check
+    opp_check = check_opposite_bound_intact(
+        highs, lows, closes,
+        touches["last_touch_idx"], i,
+        range_info, entry_side)
+    if not opp_check["opposite_intact"]:
+        return {"passed": False, "reason": "opposite_bound_broken"}
+
+    # Step 5c: Post-touch trend contradiction
+    if opp_check["post_touch_trend"] == "bearish" and entry_info["side"] == "long":
+        return {"passed": False, "reason": "post_touch_bearish_vs_long"}
+    if opp_check["post_touch_trend"] == "bullish" and entry_info["side"] == "short":
+        return {"passed": False, "reason": "post_touch_bullish_vs_short"}
+
+    # Step 6: VWAP bands
+    vwap_info = compute_vwap_bands(df, i)
+
+    # Step 7: SL/TP
+    sl_tp = compute_sl_tp(df, i, entry_info["entry_price"],
+                          entry_info["side"], range_info, vwap_info, cfg)
+    if sl_tp is None:
+        return {"passed": False, "reason": "sl_tp_invalid"}
+
+    # Step 8: VWAP clear path
+    vwap_check = check_vwap_clear_path(
+        entry_info["entry_price"], sl_tp["tp"],
+        entry_info["side"], vwap_info)
+    if not vwap_check["vwap_clear"]:
+        return {"passed": False, "reason": f"vwap_blocked_{vwap_check['blocking_band']}"}
+
+    # Step 9: Noise classification
+    noise = classify_noise(closes, i, cfg)
+
+    # Step 10: DPS scoring
+    dps = evaluate_dps(df, i, range_info, entry_info, cfg)
+
+    # Build touch timestamps
+    touch_timestamps = "|".join(
+        str(df.iloc[idx]["timestamp"]) for idx in touches["touch_indices"]
+    )
+
+    return {
+        "passed": True,
+        "reason": "all_gates_passed",
+        "side": entry_info["side"],
+        "entry": round(entry_info["entry_price"], 8),
+        "level_price": round(entry_info["level_price"], 8),
+        "level_side": entry_side,
+        "overshoot_pct": entry_info["overshoot_pct"],
+        "range_upper": round(range_info["upper"], 8),
+        "range_lower": round(range_info["lower"], 8),
+        "range_width_pct": range_info["width_pct"],
+        "range_duration_hrs": range_info["duration_hrs"],
+        "range_containment_pct": range_info["containment_pct"],
+        "range_efficiency": range_info["efficiency"],
+        "touches": touches["count"],
+        "break_count": touches["break_count"],
+        "break_pct": touches["break_pct"],
+        "bars_since_last_touch": bars_since_last,
+        "post_touch_trend": opp_check["post_touch_trend"],
+        "pre_chop_trend": pre_trend["trend"],
+        "pre_chop_move_pct": pre_trend["move_pct"],
+        "vwap": vwap_info.get("vwap"),
+        "vwap_upper": vwap_info.get("vwap_upper"),
+        "vwap_lower": vwap_info.get("vwap_lower"),
+        **noise,
+        **dps,
+        **sl_tp,
+        "touch_timestamps": touch_timestamps,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main scanner
 # ---------------------------------------------------------------------------
 
@@ -824,121 +967,22 @@ def scan_symbol(df: pd.DataFrame, symbol: str, cfg: MRSettings) -> list[dict]:
         if i <= cooldown_until:
             continue
 
-        # Step 1: Detect choppy range
-        range_info = detect_choppy_range(highs, lows, closes, i, cfg)
-        if range_info is None:
+        result = check_mr_gates_at_bar(df, i, cfg)
+        if not result["passed"]:
             continue
-
-        # Step 2: Determine side from pre-chop trend
-        pre_trend = detect_pre_chop_trend(closes, range_info["start_idx"])
-
-        # Step 3: Check if current bar is at the correct range boundary
-        entry_info = detect_range_entry(df, i, range_info, cfg)
-        if entry_info is None:
-            continue
-
-        # Filter: side must match pre-chop trend direction
-        # Up trend before chop → long (entry at lower bound)
-        # Down trend before chop → short (entry at upper bound)
-        if pre_trend["preferred_side"] is not None:
-            if entry_info["side"] != pre_trend["preferred_side"]:
-                continue
-
-        # Step 4: Count touches on the entry side + check level integrity
-        entry_side = entry_info["level_side"]  # "upper" or "lower"
-        touches = count_level_touches(
-            highs, lows, closes, opens,
-            range_info["start_idx"], i,
-            entry_info["level_price"],
-            entry_side,
-            debounce_bars=cfg.touch_cluster_bars,
-        )
-
-        if touches["count"] < cfg.min_touches:
-            continue
-
-        # Level integrity: reject if price body broke through too often
-        # Allow max 5% of bars to have broken the level
-        if touches["break_pct"] > 5.0:
-            continue
-
-        # Step 5: Check last touch recency (within 30 bars/minutes)
-        if touches["last_touch_idx"] < 0:
-            continue
-        bars_since_last = i - touches["last_touch_idx"]
-        if bars_since_last > cfg.last_touch_max_bars:
-            continue
-
-        # Step 5b: Check opposite boundary intact after last touch
-        opp_check = check_opposite_bound_intact(
-            highs, lows, closes,
-            touches["last_touch_idx"], i,
-            range_info, entry_side)
-        if not opp_check["opposite_intact"]:
-            continue  # opposite side broke — range character changed
-
-        # Step 5c: Check post-touch trend doesn't contradict entry side
-        # Long entry but bearish shift after last touch → skip
-        # Short entry but bullish shift after last touch → skip
-        if opp_check["post_touch_trend"] == "bearish" and entry_info["side"] == "long":
-            continue
-        if opp_check["post_touch_trend"] == "bullish" and entry_info["side"] == "short":
-            continue
-
-        # Step 6: VWAP bands
-        vwap_info = compute_vwap_bands(df, i)
-
-        # Step 7: SL/TP (uses range width for TP, VWAP for SL)
-        sl_tp = compute_sl_tp(df, i, entry_info["entry_price"],
-                              entry_info["side"], range_info, vwap_info, cfg)
-        if sl_tp is None:
-            continue
-
-        # Step 8: Check VWAP clear path (no band between entry and TP)
-        vwap_check = check_vwap_clear_path(
-            entry_info["entry_price"], sl_tp["tp"],
-            entry_info["side"], vwap_info)
-        if not vwap_check["vwap_clear"]:
-            continue
-
-        # Step 9: Noise classification
-        noise = classify_noise(closes, i, cfg)
-
-        # Step 10: DPS scoring
-        dps = evaluate_dps(df, i, range_info, entry_info, cfg)
 
         entry_ts = df.iloc[i]["timestamp"]
 
         setup = {
             "symbol": symbol,
             "timestamp": str(entry_ts),
-            "side": entry_info["side"],
-            "entry": round(entry_info["entry_price"], 8),
-            "level_price": round(entry_info["level_price"], 8),
-            "level_side": entry_side,
-            "overshoot_pct": entry_info["overshoot_pct"],
-            "range_upper": round(range_info["upper"], 8),
-            "range_lower": round(range_info["lower"], 8),
-            "range_width_pct": range_info["width_pct"],
-            "range_duration_hrs": range_info["duration_hrs"],
-            "range_containment_pct": range_info["containment_pct"],
-            "range_efficiency": range_info["efficiency"],
-            "touches": touches["count"],
-            "break_count": touches["break_count"],
-            "break_pct": touches["break_pct"],
-            "bars_since_last_touch": bars_since_last,
-            "post_touch_trend": opp_check["post_touch_trend"],
-            "pre_chop_trend": pre_trend["trend"],
-            "pre_chop_move_pct": pre_trend["move_pct"],
-            "vwap": vwap_info.get("vwap"),
-            "vwap_upper": vwap_info.get("vwap_upper"),
-            "vwap_lower": vwap_info.get("vwap_lower"),
-            **noise,
-            **dps,
-            **sl_tp,
         }
-        setups.append(setup)
+        # Copy all fields from result except internal ones
+        for k, v in result.items():
+            if k not in ("passed", "reason"):
+                setup[k] = v
 
+        setups.append(setup)
         cooldown_until = i + cfg.cooldown_bars
 
     return setups
@@ -961,11 +1005,12 @@ def main():
     cfg = MRSettings.from_json(args.settings) if args.settings else MRSettings()
 
     dataset_dir = Path(args.dataset_dir)
-    csv_files = sorted(dataset_dir.glob("*_1m.csv"))
+    csv_files = sorted(dataset_dir.glob("*_1m*.csv"))
 
     if args.symbols:
         wanted = {s.strip() for s in args.symbols.split(",")}
-        csv_files = [f for f in csv_files if f.stem.replace("_1m", "") in wanted]
+        csv_files = [f for f in csv_files
+                     if f.stem.split("_1m")[0] in wanted]
 
     exclude = set()
     if args.exclude_symbols:
@@ -977,7 +1022,7 @@ def main():
 
     all_setups = []
     for fi, csv_path in enumerate(csv_files):
-        symbol = csv_path.stem.replace("_1m", "")
+        symbol = csv_path.stem.split("_1m")[0]
         if symbol in exclude:
             continue
 

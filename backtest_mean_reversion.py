@@ -104,7 +104,11 @@ def main():
         result["tp_pct"] = setup["tp_pct"]
         result["rr"] = setup.get("rr", 1.0)
         result["dps_total"] = setup["dps_total"]
-        result["dps_confidence"] = setup["dps_confidence"]
+        # Force low confidence if pre-chop trend is unclear
+        dps_conf = setup["dps_confidence"]
+        if setup.get("pre_chop_trend") == "unclear":
+            dps_conf = "low"
+        result["dps_confidence"] = dps_conf
         result["noise_level"] = setup["noise_level"]
         result["touches"] = setup["touches"]
         result["break_pct"] = setup.get("break_pct", 0)
