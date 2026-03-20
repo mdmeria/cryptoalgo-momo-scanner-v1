@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import hmac
 import json
 import logging
 import os
@@ -104,36 +103,40 @@ class BitunixClient:
         self.dry_run = dry_run
         self.session = requests.Session()
 
-    def _sign(self, body_str: str, timestamp: str, nonce: str) -> str:
-        """Generate HMAC-SHA256 signature per Bitunix docs."""
-        # Step 1: hash the body
-        digest = hashlib.sha256(body_str.encode()).hexdigest()
-        # Step 2: sign with secret
-        sign_str = nonce + str(timestamp) + self.api_key + digest
-        signature = hmac.new(
-            self.api_secret.encode(), sign_str.encode(), hashlib.sha256
+    def _sign(self, query_str: str, body_str: str,
+              timestamp: str, nonce: str) -> str:
+        """
+        Generate signature per Bitunix docs (double SHA256).
+        Step 1: digest = SHA256(nonce + timestamp + apiKey + queryParams + body)
+        Step 2: sign = SHA256(digest + secretKey)
+        """
+        raw = nonce + timestamp + self.api_key + query_str + body_str
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        signature = hashlib.sha256(
+            (digest + self.api_secret).encode()
         ).hexdigest()
         return signature
 
-    def _headers(self, body_str: str = "") -> dict:
+    def _headers(self, query_str: str = "", body_str: str = "") -> dict:
         timestamp = str(int(time.time() * 1000))
         nonce = uuid.uuid4().hex
         return {
             "api-key": self.api_key,
             "timestamp": timestamp,
             "nonce": nonce,
-            "sign": self._sign(body_str, timestamp, nonce),
+            "sign": self._sign(query_str, body_str, timestamp, nonce),
             "Content-Type": "application/json",
             "language": "en",
         }
 
     def _get(self, path: str, params: dict = None) -> dict:
         url = f"{self.BASE}{path}"
-        body_str = ""
+        # Sort query params by key (ASCII ascending) and concat key+value
+        query_str = ""
         if params:
-            # For GET, query params are part of URL but sign uses empty body
-            pass
-        headers = self._headers(body_str)
+            sorted_keys = sorted(params.keys())
+            query_str = "".join(k + str(params[k]) for k in sorted_keys)
+        headers = self._headers(query_str=query_str, body_str="")
         resp = self.session.get(url, params=params, headers=headers, timeout=10)
         resp.raise_for_status()
         return resp.json()
@@ -141,7 +144,7 @@ class BitunixClient:
     def _post(self, path: str, data: dict) -> dict:
         url = f"{self.BASE}{path}"
         body_str = json.dumps(data, separators=(",", ":"))
-        headers = self._headers(body_str)
+        headers = self._headers(query_str="", body_str=body_str)
 
         if self.dry_run:
             logger.info("[DRY RUN] POST %s: %s", path, body_str[:200])
@@ -151,6 +154,21 @@ class BitunixClient:
         resp = self.session.post(url, data=body_str, headers=headers, timeout=10)
         resp.raise_for_status()
         return resp.json()
+
+    # --- Market Info ---
+
+    def get_trading_pairs(self) -> dict:
+        """Fetch all trading pairs. Returns {symbol: {maxLeverage, ...}}."""
+        try:
+            resp = self.session.get(
+                f"{self.BASE}/api/v1/futures/market/trading_pairs", timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("code") == 0:
+                return {p["symbol"]: p for p in data.get("data", [])}
+        except Exception as e:
+            logger.error("Trading pairs error: %s", e)
+        return {}
 
     # --- Account ---
 
@@ -163,6 +181,28 @@ class BitunixClient:
         return result.get("data", {})
 
     # --- Positions ---
+
+    def get_history_position(self, position_id: str = None,
+                             symbol: str = None) -> dict:
+        """Get closed position details (close price, realized PnL)."""
+        params = {}
+        if position_id:
+            params["positionId"] = position_id
+        if symbol:
+            params["symbol"] = symbol
+        if not params:
+            return {}
+        params["limit"] = "5"
+        result = self._get("/api/v1/futures/position/get_history_positions", params)
+        logger.debug("History position result: %s", str(result)[:500])
+        if result.get("code") != 0:
+            logger.warning("History position error: %s", result.get("msg"))
+            return {}
+        data = result.get("data", {})
+        positions = data.get("positionList", data if isinstance(data, list) else [])
+        if positions:
+            return positions[0]
+        return {}
 
     def get_positions(self, symbol: str = None) -> list:
         """Get open positions."""
@@ -253,6 +293,144 @@ class BitunixClient:
             data["positionId"] = position_id
         return self._post("/api/v1/futures/trade/place_order", data)
 
+    # --- Order Details ---
+
+    def get_order_detail(self, symbol: str, order_id: str) -> dict:
+        """Get order fill details (actual fill price, qty, status)."""
+        params = {"symbol": symbol, "orderId": order_id}
+        result = self._get("/api/v1/futures/trade/get_order_detail", params)
+        if result.get("code") != 0:
+            logger.debug("Order detail error %s: %s", symbol, result.get("msg"))
+            return {}
+        return result.get("data", {})
+
+    # --- Pre-Trade Setup ---
+
+    def ensure_margin_and_leverage(self, symbol: str, leverage: int,
+                                    margin_mode: str = "ISOLATION"):
+        """Set margin mode and leverage for a symbol. Safe to call repeatedly."""
+        try:
+            self.set_margin_mode(symbol, margin_mode)
+        except Exception:
+            pass  # May fail if already set or position exists
+        try:
+            self.set_leverage(symbol, leverage, "LONG")
+            self.set_leverage(symbol, leverage, "SHORT")
+        except Exception:
+            pass
+
+    # --- Full Order Flow ---
+
+    def place_order_and_verify(self, symbol: str, side: str, qty: str,
+                                tp_price: str, sl_price: str,
+                                leverage: int, margin_mode: str = "ISOLATION",
+                                tp_sl_type: str = "LAST_PRICE") -> dict:
+        """
+        Complete order flow:
+        1. Set margin mode + leverage
+        2. Place market order with TP/SL
+        3. Wait briefly for fill
+        4. Get actual fill price and position ID
+        5. Verify TP/SL is attached
+        6. Recalculate TP/SL from actual fill if needed
+        Returns dict with all details or empty dict on failure.
+        """
+        # Step 1: Ensure margin mode and leverage
+        self.ensure_margin_and_leverage(symbol, leverage, margin_mode)
+
+        # Step 2: Place order
+        result = self.place_order(
+            symbol=symbol, side=side, qty=qty,
+            order_type="MARKET",
+            tp_price=tp_price, sl_price=sl_price,
+            tp_sl_type=tp_sl_type)
+
+        if result.get("code") != 0:
+            return {"success": False, "error": result.get("msg", "Unknown")}
+
+        order_id = result.get("data", {}).get("orderId", "")
+        if not order_id:
+            return {"success": False, "error": "No orderId returned"}
+
+        # Step 3: Wait briefly for fill
+        time.sleep(0.5)
+
+        # Step 4: Get actual fill price
+        order_detail = self.get_order_detail(symbol, order_id)
+        actual_fill = float(order_detail.get("avgPrice", 0))
+        filled_qty = float(order_detail.get("executedQty", 0))
+        order_status = order_detail.get("status", "UNKNOWN")
+
+        if actual_fill <= 0:
+            # Retry once
+            time.sleep(1)
+            order_detail = self.get_order_detail(symbol, order_id)
+            actual_fill = float(order_detail.get("avgPrice", 0))
+            filled_qty = float(order_detail.get("executedQty", 0))
+            order_status = order_detail.get("status", "UNKNOWN")
+
+        # Step 5: Get position ID
+        position_id = None
+        positions = self.get_positions(symbol)
+        side_str = "LONG" if side == "BUY" else "SHORT"
+        for pos in positions:
+            if pos.get("side") == side_str:
+                position_id = pos.get("positionId")
+                break
+
+        # Step 6: If fill price differs significantly, recalculate TP/SL
+        recalculated = False
+        if actual_fill > 0 and position_id:
+            expected_entry = float(tp_price if side == "SELL" else sl_price)
+            # We have the original setup entry — check slippage
+            # Recalculate TP/SL based on actual fill
+            orig_tp = float(tp_price)
+            orig_sl = float(sl_price)
+
+            if side == "BUY":  # long
+                orig_entry_approx = orig_sl / (1 - 0.01)  # rough estimate
+                sl_dist = actual_fill - orig_sl
+                tp_dist = orig_tp - actual_fill
+                # If slippage > 0.1%, adjust TP/SL
+                slippage = abs(actual_fill - orig_entry_approx) / actual_fill * 100
+                if slippage > 0.1:
+                    new_sl = actual_fill - sl_dist
+                    new_tp = actual_fill + tp_dist
+                    self.modify_tp_sl(symbol, position_id,
+                                      sl_price=str(round(new_sl, 8)),
+                                      tp_price=str(round(new_tp, 8)),
+                                      qty=str(filled_qty))
+                    recalculated = True
+                    logger.info("    Recalculated TP/SL: fill=%.6g (slippage=%.2f%%) "
+                                "new_tp=%.6g new_sl=%.6g",
+                                actual_fill, slippage, new_tp, new_sl)
+            else:  # short
+                sl_dist = orig_sl - actual_fill
+                tp_dist = actual_fill - orig_tp
+                orig_entry_approx = orig_sl / (1 + 0.01)
+                slippage = abs(actual_fill - orig_entry_approx) / actual_fill * 100
+                if slippage > 0.1:
+                    new_sl = actual_fill + sl_dist
+                    new_tp = actual_fill - tp_dist
+                    self.modify_tp_sl(symbol, position_id,
+                                      sl_price=str(round(new_sl, 8)),
+                                      tp_price=str(round(new_tp, 8)),
+                                      qty=str(filled_qty))
+                    recalculated = True
+                    logger.info("    Recalculated TP/SL: fill=%.6g (slippage=%.2f%%) "
+                                "new_tp=%.6g new_sl=%.6g",
+                                actual_fill, slippage, new_tp, new_sl)
+
+        return {
+            "success": True,
+            "order_id": order_id,
+            "position_id": position_id,
+            "actual_fill": actual_fill,
+            "filled_qty": filled_qty,
+            "order_status": order_status,
+            "recalculated": recalculated,
+        }
+
     # --- Leverage & Margin ---
 
     def set_leverage(self, symbol: str, leverage: int, side: str = "LONG"):
@@ -325,7 +503,51 @@ class LivePositionTracker:
                 remaining.append(lp)
             else:
                 # Position no longer on exchange — it was closed (TP/SL hit)
-                lp["outcome"] = "CLOSED_BY_EXCHANGE"
+                # Fetch close details from history
+                pos_id = lp.get("exchange_position_id")
+                hist = None
+                if pos_id:
+                    hist = self.client.get_history_position(position_id=pos_id)
+                    if not hist:
+                        logger.debug("History by positionId %s returned empty", pos_id)
+                if not hist:
+                    hist = self.client.get_history_position(symbol=lp["symbol"])
+                    if not hist:
+                        logger.warning("History by symbol %s also returned empty", lp["symbol"])
+
+                if hist and float(hist.get("closePrice", 0)) > 0:
+                    close_price = float(hist.get("closePrice", 0))
+                    realized_pnl = float(hist.get("realizedPNL", 0))
+                    fee = float(hist.get("fee", 0))
+                    funding = float(hist.get("funding", 0))
+                    entry_price = lp["entry"]
+                    side = lp["side"]
+
+                    if side == "long":
+                        pnl_pct = (close_price - entry_price) / entry_price * 100
+                        if close_price >= lp.get("tp", 0) * 0.999:
+                            lp["outcome"] = "TP"
+                        elif close_price <= lp.get("sl", 0) * 1.001:
+                            lp["outcome"] = "SL"
+                        else:
+                            lp["outcome"] = "TRAIL_SL" if lp.get("sl_trailed") else "CLOSED"
+                    else:
+                        pnl_pct = (entry_price - close_price) / entry_price * 100
+                        if close_price <= lp.get("tp", 0) * 1.001:
+                            lp["outcome"] = "TP"
+                        elif close_price >= lp.get("sl", 0) * 0.999:
+                            lp["outcome"] = "SL"
+                        else:
+                            lp["outcome"] = "TRAIL_SL" if lp.get("sl_trailed") else "CLOSED"
+
+                    lp["close_price"] = close_price
+                    lp["pnl_pct"] = round(pnl_pct, 4)
+                    lp["realized_pnl"] = realized_pnl
+                    lp["fee"] = fee
+                    lp["funding"] = funding
+                else:
+                    lp["outcome"] = "CLOSED_BY_EXCHANGE"
+
                 closed.append(lp)
 
         self.local_positions = remaining
@@ -453,6 +675,7 @@ def trading_cycle(client: BitunixClient, pos_tracker: LivePositionTracker,
                   candle_cache: dict, depth_cooldown: dict,
                   market_cond: MarketCondition,
                   approved_symbols: set,
+                  pairs_info: dict,
                   cycle_num: int) -> dict:
     """One live trading cycle."""
     trading_cfg = config["trading"]
@@ -473,9 +696,16 @@ def trading_cycle(client: BitunixClient, pos_tracker: LivePositionTracker,
     # Step 1: Sync positions with exchange
     closed_by_exchange = pos_tracker.sync_with_exchange()
     for ct in closed_by_exchange:
-        logger.info("  CLOSED by exchange: %s %s %s",
-                     ct["strategy"], ct["side"], ct["symbol"])
+        outcome = ct.get("outcome", "CLOSED")
+        close_price = ct.get("close_price", 0)
+        pnl_pct = ct.get("pnl_pct", 0)
+        realized = ct.get("realized_pnl", 0)
+        fee = ct.get("fee", 0)
+        logger.info("  %s %s %s %s: close=%.6g PnL=%.2f%% realized=$%.2f fee=$%.2f",
+                     outcome, ct["strategy"].upper(), ct["side"].upper(),
+                     ct["symbol"], close_price, pnl_pct, realized, fee)
         log_trade(ct, "CLOSED")
+        pnl_tracker.add_trade(pnl_pct)
 
     # Step 2: Get active coins
     coins = fetch_orion_active_coins(
@@ -491,6 +721,11 @@ def trading_cycle(client: BitunixClient, pos_tracker: LivePositionTracker,
     if approved_symbols:
         new_coins = coin_symbols - approved_symbols - open_syms
         for sym in new_coins:
+            # Skip logging for likely tokenized stocks (leverage <= 10)
+            pair_info = pairs_info.get(sym, {})
+            max_lev = pair_info.get("maxLeverage", 999)
+            if isinstance(max_lev, (int, float)) and max_lev <= 10:
+                continue  # likely tokenized stock, skip silently
             c = next((c for c in coins if c["symbol"] == sym), {})
             logger.info("  NEW COIN not in whitelist: %s (vol=$%.0f)",
                         sym, c.get("volume_5m", 0))
@@ -616,10 +851,15 @@ def trading_cycle(client: BitunixClient, pos_tracker: LivePositionTracker,
             if pos_tracker.has_position(sym, strat):
                 continue
 
-            # Cooldown for depth strategies
-            if strat in ("depth", "depth_bounce") and depth_cooldown:
+            # One position per coin across ALL strategies
+            if sym in pos_tracker.get_all_symbols():
+                continue
+
+            # Cooldown for depth strategies (30 min = 1800 seconds)
+            if strat in ("depth", "depth_bounce") and depth_cooldown is not None:
                 cd_key = f"{sym}_{strat}"
-                if cycle_num - depth_cooldown.get(cd_key, -999) < 30:
+                last_trade_time = depth_cooldown.get(cd_key, 0)
+                if time.time() - last_trade_time < 1800:
                     continue
 
             # Market condition filter
@@ -686,34 +926,57 @@ def trading_cycle(client: BitunixClient, pos_tracker: LivePositionTracker,
                 logger.info("    DUMMY logged: %s", sym)
 
             elif strat_mode == "live":
-                result = client.place_order(
+                result = client.place_order_and_verify(
                     symbol=sym,
                     side=order_side,
                     qty=qty,
-                    order_type=trading_cfg["order_type"],
                     tp_price=tp_price,
                     sl_price=sl_price,
+                    leverage=trading_cfg["leverage"],
+                    margin_mode=trading_cfg["margin_mode"],
                     tp_sl_type=trading_cfg["tp_sl_type"],
                 )
 
-                if result.get("code") == 0:
-                    order_id = result.get("data", {}).get("orderId", "?")
+                if result.get("success"):
+                    order_id = result["order_id"]
+                    actual_fill = result["actual_fill"]
+                    position_id = result["position_id"]
+
                     setup["order_id"] = order_id
-                    setup["qty"] = qty
+                    setup["exchange_position_id"] = position_id
+                    setup["qty"] = result.get("filled_qty", qty)
+                    setup["actual_fill"] = actual_fill
                     setup["risk_pct"] = risk_pct
                     setup["market_score"] = market_cond.score
                     setup["bars_held"] = 0
                     setup["mode"] = "live"
+
+                    # Log slippage if any
+                    if actual_fill > 0:
+                        slippage = abs(actual_fill - entry_price) / entry_price * 100
+                        setup["slippage_pct"] = round(slippage, 4)
+                        if slippage > 0.05:
+                            logger.info("    SLIPPAGE: expected=%.6g actual=%.6g (%.3f%%)",
+                                        entry_price, actual_fill, slippage)
+
                     pos_tracker.add_position(setup)
                     log_trade(setup, "ENTRY_LIVE")
                     stats["orders"] += 1
-                    logger.info("    ORDER FILLED: %s (id=%s)", sym, order_id)
+
+                    logger.info("    FILLED: %s id=%s posId=%s fill=%.6g qty=%s %s",
+                                sym, order_id, position_id or "?",
+                                actual_fill, result.get("filled_qty", "?"),
+                                "(TP/SL recalculated)" if result["recalculated"] else "")
                 else:
                     stats["errors"] += 1
-                    logger.error("    ORDER FAILED: %s — %s", sym, result.get("msg"))
+                    logger.error("    ORDER FAILED: %s — %s",
+                                 sym, result.get("error", "Unknown"))
 
-            if strat in ("depth", "depth_bounce") and depth_cooldown:
-                depth_cooldown[f"{sym}_{strat}"] = cycle_num
+            if strat in ("depth", "depth_bounce") and depth_cooldown is not None:
+                depth_cooldown[f"{sym}_{strat}"] = time.time()
+                # Persist cooldown
+                with open(TRADER_DIR / "depth_cooldown.json", "w") as _cf:
+                    json.dump(depth_cooldown, _cf)
 
         time.sleep(0.12)
 
@@ -770,7 +1033,15 @@ def main():
     pnl_tracker = DailyPnLTracker(config["trading"]["max_daily_loss_pct"])
     market_cond = MarketCondition()
     candle_cache = {}
-    depth_cooldown = {}
+
+    # Persistent cooldown — survives restarts
+    cooldown_file = TRADER_DIR / "depth_cooldown.json"
+    if cooldown_file.exists():
+        with open(cooldown_file) as f:
+            depth_cooldown = json.load(f)
+        logger.info("  Loaded cooldown: %d symbols on cooldown", len(depth_cooldown))
+    else:
+        depth_cooldown = {}
 
     mode = "DRY RUN" if dry_run else "LIVE"
     strat_modes = config.get("strategies", {})
@@ -787,10 +1058,14 @@ def main():
                 config["trading"]["max_positions"],
                 config["trading"]["leverage"])
 
+    # Load trading pairs info (for leverage check)
+    pairs_info = client.get_trading_pairs()
+    logger.info("  Trading pairs loaded: %d", len(pairs_info))
+
     if args.once:
         trading_cycle(client, pos_tracker, pnl_tracker, config,
                       candle_cache, depth_cooldown, market_cond,
-                      approved, 1)
+                      approved, pairs_info, 1)
         return
 
     cycle = 0
@@ -800,7 +1075,7 @@ def main():
         try:
             trading_cycle(client, pos_tracker, pnl_tracker, config,
                           candle_cache, depth_cooldown, market_cond,
-                          approved, cycle)
+                          approved, pairs_info, cycle)
         except KeyboardInterrupt:
             logger.info("Stopped by user")
             break

@@ -47,7 +47,7 @@ class DepthStrategySettings:
     """Settings for the depth-of-book strategy."""
     min_sl_pct: float = 1.0           # Minimum SL distance %
     max_sl_pct: float = 3.0           # Maximum SL distance %
-    min_rr: float = 1.0               # Minimum TP:SL ratio
+    min_rr: float = 1.2               # Minimum TP:SL ratio (covers fees + slippage)
     min_wall_strength: float = 3.0    # Min wall strength (x avg) for SL backing
     min_wall_usd: float = 5000.0      # Min wall USD value for SL backing
     min_imbalance: float = 0.05       # Min depth imbalance to pick direction
