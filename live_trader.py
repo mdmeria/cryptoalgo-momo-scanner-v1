@@ -1,0 +1,815 @@
+#!/usr/bin/env python3
+"""
+Live Trader — Real order execution on Bitunix.
+
+Uses the same strategy logic as live_dummy_trader.py but executes
+real orders via Bitunix API.
+
+Usage:
+  python live_trader.py [--dry-run] [--once]
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+import logging
+import os
+import sys
+import time
+import uuid
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+import requests
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+handler = logging.StreamHandler(stream=sys.stderr)
+handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s %(message)s",
+                                        datefmt="%H:%M:%S"))
+logger = logging.getLogger("live_trader")
+logger.setLevel(logging.INFO)
+logger.addHandler(handler)
+
+# ---------------------------------------------------------------------------
+# Imports from existing modules (strategy logic unchanged)
+# ---------------------------------------------------------------------------
+from live_data_collector import (
+    fetch_orion_active_coins,
+    fetch_bitunix_depth,
+    fetch_bitunix_klines,
+    LIVE_DIR,
+    BITUNIX_BASE,
+)
+from strategies import (
+    StrategyConfig,
+    MRSettings,
+    MomoGateSettings,
+    detect_setups,
+    get_risk_pct,
+    check_75pct_tp_rule,
+    MarketCondition,
+    DEPTH_EXCLUDED_SYMBOLS,
+)
+from live_dummy_trader import (
+    fetch_klines_paginated,
+    load_approved_symbols,
+    MR_WARMUP_BARS,
+)
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+CONFIG_FILE = Path("live_trading_config.json")
+TRADER_DIR = LIVE_DIR / "live_trader"
+TRADES_LOG = TRADER_DIR / "trades.csv"
+POSITIONS_FILE = TRADER_DIR / "positions_local.json"
+DAILY_PNL_FILE = TRADER_DIR / "daily_pnl.json"
+NEW_COINS_LOG = TRADER_DIR / "new_coins.csv"
+
+_strategy_cfg = StrategyConfig.from_json()
+_mr_cfg = MRSettings()
+_momo_gate_cfg = MomoGateSettings.from_json("momo_gate_settings.json")
+
+
+def load_config() -> dict:
+    if not CONFIG_FILE.exists():
+        logger.error("Config file not found: %s", CONFIG_FILE)
+        sys.exit(1)
+    with open(CONFIG_FILE) as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# Bitunix API Client
+# ---------------------------------------------------------------------------
+
+class BitunixClient:
+    """Authenticated Bitunix Futures API client."""
+
+    BASE = BITUNIX_BASE
+
+    def __init__(self, api_key: str, api_secret: str, dry_run: bool = True):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.dry_run = dry_run
+        self.session = requests.Session()
+
+    def _sign(self, body_str: str, timestamp: str, nonce: str) -> str:
+        """Generate HMAC-SHA256 signature per Bitunix docs."""
+        # Step 1: hash the body
+        digest = hashlib.sha256(body_str.encode()).hexdigest()
+        # Step 2: sign with secret
+        sign_str = nonce + str(timestamp) + self.api_key + digest
+        signature = hmac.new(
+            self.api_secret.encode(), sign_str.encode(), hashlib.sha256
+        ).hexdigest()
+        return signature
+
+    def _headers(self, body_str: str = "") -> dict:
+        timestamp = str(int(time.time() * 1000))
+        nonce = uuid.uuid4().hex
+        return {
+            "api-key": self.api_key,
+            "timestamp": timestamp,
+            "nonce": nonce,
+            "sign": self._sign(body_str, timestamp, nonce),
+            "Content-Type": "application/json",
+            "language": "en",
+        }
+
+    def _get(self, path: str, params: dict = None) -> dict:
+        url = f"{self.BASE}{path}"
+        body_str = ""
+        if params:
+            # For GET, query params are part of URL but sign uses empty body
+            pass
+        headers = self._headers(body_str)
+        resp = self.session.get(url, params=params, headers=headers, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _post(self, path: str, data: dict) -> dict:
+        url = f"{self.BASE}{path}"
+        body_str = json.dumps(data, separators=(",", ":"))
+        headers = self._headers(body_str)
+
+        if self.dry_run:
+            logger.info("[DRY RUN] POST %s: %s", path, body_str[:200])
+            return {"code": 0, "data": {"orderId": f"dry_{int(time.time())}"},
+                    "msg": "Dry run"}
+
+        resp = self.session.post(url, data=body_str, headers=headers, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    # --- Account ---
+
+    def get_balance(self, margin_coin: str = "USDT") -> dict:
+        """Get account balance."""
+        result = self._get("/api/v1/futures/account", {"marginCoin": margin_coin})
+        if result.get("code") != 0:
+            logger.error("Balance error: %s", result.get("msg"))
+            return {}
+        return result.get("data", {})
+
+    # --- Positions ---
+
+    def get_positions(self, symbol: str = None) -> list:
+        """Get open positions."""
+        params = {}
+        if symbol:
+            params["symbol"] = symbol
+        result = self._get("/api/v1/futures/position/get_pending_positions", params)
+        if result.get("code") != 0:
+            logger.error("Positions error: %s", result.get("msg"))
+            return []
+        return result.get("data", []) or []
+
+    # --- Orders ---
+
+    def place_order(self, symbol: str, side: str, qty: str,
+                    order_type: str = "MARKET", price: str = None,
+                    tp_price: str = None, sl_price: str = None,
+                    tp_sl_type: str = "LAST_PRICE",
+                    leverage: int = None, margin_mode: str = None) -> dict:
+        """
+        Place a futures order with optional TP/SL.
+        side: BUY or SELL
+        """
+        data = {
+            "symbol": symbol,
+            "qty": str(qty),
+            "side": side,
+            "tradeSide": "OPEN",
+            "orderType": order_type,
+        }
+
+        if price and order_type == "LIMIT":
+            data["price"] = str(price)
+
+        if tp_price:
+            data["tpPrice"] = str(tp_price)
+            data["tpStopType"] = tp_sl_type
+            data["tpOrderType"] = "MARKET"
+
+        if sl_price:
+            data["slPrice"] = str(sl_price)
+            data["slStopType"] = tp_sl_type
+            data["slOrderType"] = "MARKET"
+
+        result = self._post("/api/v1/futures/trade/place_order", data)
+        if result.get("code") != 0:
+            logger.error("Order error %s: %s", symbol, result.get("msg"))
+        return result
+
+    def modify_tp_sl(self, symbol: str, position_id: str,
+                     sl_price: str = None, tp_price: str = None,
+                     qty: str = None,
+                     tp_sl_type: str = "LAST_PRICE") -> dict:
+        """Modify TP/SL on an existing position."""
+        data = {
+            "symbol": symbol,
+            "positionId": position_id,
+        }
+        if tp_price:
+            data["tpPrice"] = str(tp_price)
+            data["tpStopType"] = tp_sl_type
+            data["tpOrderType"] = "MARKET"
+        if sl_price:
+            data["slPrice"] = str(sl_price)
+            data["slStopType"] = tp_sl_type
+            data["slOrderType"] = "MARKET"
+        if qty:
+            data["tpQty"] = str(qty)
+            data["slQty"] = str(qty)
+
+        result = self._post("/api/v1/futures/tpsl/place_order", data)
+        if result.get("code") != 0:
+            logger.error("TP/SL modify error %s: %s", symbol, result.get("msg"))
+        return result
+
+    def close_position(self, symbol: str, side: str, qty: str,
+                       position_id: str = None) -> dict:
+        """Close a position via market order."""
+        close_side = "SELL" if side == "LONG" else "BUY"
+        data = {
+            "symbol": symbol,
+            "qty": str(qty),
+            "side": close_side,
+            "tradeSide": "CLOSE",
+            "orderType": "MARKET",
+        }
+        if position_id:
+            data["positionId"] = position_id
+        return self._post("/api/v1/futures/trade/place_order", data)
+
+    # --- Leverage & Margin ---
+
+    def set_leverage(self, symbol: str, leverage: int, side: str = "LONG"):
+        """Set leverage for a symbol."""
+        data = {
+            "symbol": symbol,
+            "leverage": leverage,
+            "side": side,
+        }
+        return self._post("/api/v1/futures/account/change_leverage", data)
+
+    def set_margin_mode(self, symbol: str, mode: str = "ISOLATION"):
+        """Set margin mode: ISOLATION or CROSS."""
+        data = {
+            "symbol": symbol,
+            "marginMode": mode,
+        }
+        return self._post("/api/v1/futures/account/change_margin_mode", data)
+
+
+# ---------------------------------------------------------------------------
+# Position Tracker — local state synced with exchange
+# ---------------------------------------------------------------------------
+
+class LivePositionTracker:
+    """Track positions with local state + exchange sync."""
+
+    def __init__(self, client: BitunixClient):
+        self.client = client
+        self.local_positions: list[dict] = []
+        self._load_local()
+
+    def _load_local(self):
+        if POSITIONS_FILE.exists():
+            with open(POSITIONS_FILE) as f:
+                self.local_positions = json.load(f)
+
+    def _save_local(self):
+        POSITIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(POSITIONS_FILE, "w") as f:
+            json.dump(self.local_positions, f, indent=2, default=str)
+
+    def sync_with_exchange(self):
+        """Fetch real positions from exchange and sync with local state."""
+        exchange_positions = self.client.get_positions()
+        if not exchange_positions:
+            # No positions on exchange — clear local if any were closed
+            closed = self.local_positions[:]
+            self.local_positions = []
+            self._save_local()
+            return closed
+
+        # Map exchange positions by symbol+side
+        exchange_map = {}
+        for ep in exchange_positions:
+            key = f"{ep['symbol']}_{ep['side']}"
+            exchange_map[key] = ep
+
+        closed = []
+        remaining = []
+        for lp in self.local_positions:
+            side_str = "LONG" if lp["side"] == "long" else "SHORT"
+            key = f"{lp['symbol']}_{side_str}"
+            if key in exchange_map:
+                # Still open — update with exchange data
+                ep = exchange_map[key]
+                lp["exchange_position_id"] = ep.get("positionId")
+                lp["unrealized_pnl"] = float(ep.get("unrealizedPNL", 0))
+                lp["exchange_qty"] = float(ep.get("qty", 0))
+                remaining.append(lp)
+            else:
+                # Position no longer on exchange — it was closed (TP/SL hit)
+                lp["outcome"] = "CLOSED_BY_EXCHANGE"
+                closed.append(lp)
+
+        self.local_positions = remaining
+        self._save_local()
+        return closed
+
+    def has_position(self, symbol: str, strategy: str) -> bool:
+        return any(
+            p["symbol"] == symbol and p["strategy"] == strategy
+            for p in self.local_positions
+        )
+
+    def add_position(self, trade: dict):
+        self.local_positions.append(trade)
+        self._save_local()
+
+    def get_all_symbols(self) -> set:
+        return {p["symbol"] for p in self.local_positions}
+
+    def update_sl(self, symbol: str, strategy: str, new_sl: float):
+        """Update SL locally (exchange SL modification done separately)."""
+        for p in self.local_positions:
+            if p["symbol"] == symbol and p["strategy"] == strategy:
+                if "sl_original" not in p:
+                    p["sl_original"] = p["sl"]
+                p["sl"] = new_sl
+                p["sl_trailed"] = True
+                break
+        self._save_local()
+
+
+# ---------------------------------------------------------------------------
+# Daily PnL Tracker
+# ---------------------------------------------------------------------------
+
+class DailyPnLTracker:
+    """Track daily PnL for loss limits."""
+
+    def __init__(self, max_loss_pct: float = 5.0):
+        self.max_loss_pct = max_loss_pct
+        self.today_pnl = 0.0
+        self.today_trades = 0
+        self.today_date = datetime.now(timezone.utc).date()
+
+    def reset_if_new_day(self):
+        today = datetime.now(timezone.utc).date()
+        if today != self.today_date:
+            logger.info("New day — resetting daily PnL (yesterday: %.2f%%)",
+                        self.today_pnl)
+            self.today_pnl = 0.0
+            self.today_trades = 0
+            self.today_date = today
+
+    def add_trade(self, pnl_pct: float):
+        self.today_pnl += pnl_pct
+        self.today_trades += 1
+
+    def is_limit_hit(self) -> bool:
+        return self.today_pnl <= -self.max_loss_pct
+
+    def summary(self) -> str:
+        return f"Daily PnL: {self.today_pnl:+.2f}% ({self.today_trades} trades)"
+
+
+# ---------------------------------------------------------------------------
+# Trade Logger
+# ---------------------------------------------------------------------------
+
+def log_trade(trade: dict, action: str):
+    """Log trade entry/exit to CSV and console."""
+    TRADER_DIR.mkdir(parents=True, exist_ok=True)
+    write_header = not TRADES_LOG.exists()
+    with open(TRADES_LOG, "a", encoding="utf-8") as f:
+        if write_header:
+            cols = ["action"] + list(trade.keys())
+            f.write(",".join(cols) + "\n")
+        vals = [action]
+        for v in trade.values():
+            s = str(v) if v is not None else ""
+            if "," in s:
+                s = f'"{s}"'
+            vals.append(s)
+        f.write(",".join(vals) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Safety Checks
+# ---------------------------------------------------------------------------
+
+def check_kill_switch(config: dict) -> bool:
+    """Check if kill switch file exists."""
+    ks_file = config.get("safety", {}).get("kill_switch_file", "STOP_TRADING")
+    return Path(ks_file).exists()
+
+
+def calculate_qty(symbol: str, entry_price: float, risk_pct: float,
+                  sl_pct: float, balance: float, leverage: int,
+                  pairs_info: dict = None) -> str:
+    """Calculate order quantity based on risk parameters."""
+    # Risk amount in USD
+    risk_usd = balance * risk_pct / 100
+
+    # Position size from risk: risk_usd = qty * entry * sl_pct / 100
+    if sl_pct <= 0:
+        sl_pct = 1.0
+    position_usd = risk_usd / (sl_pct / 100)
+
+    # With leverage
+    qty = position_usd / entry_price
+
+    # Round to base precision
+    if pairs_info and symbol in pairs_info:
+        precision = pairs_info[symbol].get("basePrecision", 4)
+        qty = round(qty, precision)
+
+    return str(qty)
+
+
+# ---------------------------------------------------------------------------
+# Main Trading Cycle
+# ---------------------------------------------------------------------------
+
+def trading_cycle(client: BitunixClient, pos_tracker: LivePositionTracker,
+                  pnl_tracker: DailyPnLTracker, config: dict,
+                  candle_cache: dict, depth_cooldown: dict,
+                  market_cond: MarketCondition,
+                  approved_symbols: set,
+                  cycle_num: int) -> dict:
+    """One live trading cycle."""
+    trading_cfg = config["trading"]
+    scan_cfg = config["scanning"]
+    stats = {"coins": 0, "setups": 0, "orders": 0, "errors": 0}
+
+    # Safety checks
+    if check_kill_switch(config):
+        logger.warning("KILL SWITCH active — skipping cycle")
+        return stats
+
+    pnl_tracker.reset_if_new_day()
+    if pnl_tracker.is_limit_hit():
+        logger.warning("DAILY LOSS LIMIT hit (%s) — skipping cycle",
+                        pnl_tracker.summary())
+        return stats
+
+    # Step 1: Sync positions with exchange
+    closed_by_exchange = pos_tracker.sync_with_exchange()
+    for ct in closed_by_exchange:
+        logger.info("  CLOSED by exchange: %s %s %s",
+                     ct["strategy"], ct["side"], ct["symbol"])
+        log_trade(ct, "CLOSED")
+
+    # Step 2: Get active coins
+    coins = fetch_orion_active_coins(
+        min_vol_5m=scan_cfg["min_vol_5m"], top_n=scan_cfg["top_n"])
+    if not coins:
+        logger.warning("No coins from Orion")
+        return stats
+
+    open_syms = pos_tracker.get_all_symbols()
+    coin_symbols = {c["symbol"] for c in coins}
+
+    # Filter by whitelist
+    if approved_symbols:
+        new_coins = coin_symbols - approved_symbols - open_syms
+        for sym in new_coins:
+            c = next((c for c in coins if c["symbol"] == sym), {})
+            logger.info("  NEW COIN not in whitelist: %s (vol=$%.0f)",
+                        sym, c.get("volume_5m", 0))
+        coin_symbols = {s for s in coin_symbols if s in approved_symbols}
+
+    all_symbols = coin_symbols | open_syms
+    stats["coins"] = len(all_symbols)
+
+    logger.info("Cycle %d: %d coins (%d active + %d positions)",
+                cycle_num, len(all_symbols), len(coin_symbols),
+                len(open_syms - coin_symbols))
+
+    # Step 3: Update market conditions (every 120 cycles = ~2 hours)
+    if cycle_num == 1 or cycle_num % 120 == 0:
+        btc_df = fetch_klines_paginated("BTCUSDT", n_bars=MR_WARMUP_BARS)
+        if btc_df is not None and len(btc_df) >= 150:
+            candle_cache["BTCUSDT"] = btc_df
+            market_cond.update_btc(btc_df)
+        if len(candle_cache) > 10:
+            market_cond.update_breadth(candle_cache)
+        logger.info("  %s (updated)", market_cond.summary())
+    elif cycle_num % 10 == 0:
+        logger.info("  %s", market_cond.summary())
+
+    # Step 4: Check trail SL for existing positions
+    for pos in list(pos_tracker.local_positions):
+        sym = pos["symbol"]
+        if sym not in candle_cache:
+            continue
+        df = candle_cache[sym]
+        if len(df) == 0:
+            continue
+        current_high = float(df.iloc[-1]["high"])
+        current_low = float(df.iloc[-1]["low"])
+        current_close = float(df.iloc[-1]["close"])
+        entry = pos["entry"]
+        sl_orig = pos.get("sl_original", pos["sl"])
+
+        if pos.get("sl_trailed"):
+            continue
+
+        # Trail SL logic (same as dummy trader)
+        should_trail = False
+        if pos["side"] == "long":
+            r_dist = entry - sl_orig
+            target_09r = entry + r_dist * 0.9
+            new_sl = entry + r_dist * 0.1
+            if current_high >= target_09r:
+                should_trail = True
+            elif pos.get("bars_held", 0) >= 60 and current_close > entry:
+                should_trail = True
+        else:
+            r_dist = sl_orig - entry
+            target_09r = entry - r_dist * 0.9
+            new_sl = entry - r_dist * 0.1
+            if current_low <= target_09r:
+                should_trail = True
+            elif pos.get("bars_held", 0) >= 60 and current_close < entry:
+                should_trail = True
+
+        if should_trail:
+            pos_id = pos.get("exchange_position_id")
+            if pos_id:
+                logger.info("  TRAIL SL %s %s %s: moving SL to %.6g",
+                            pos["strategy"], pos["side"], sym, new_sl)
+                client.modify_tp_sl(sym, pos_id, sl_price=str(round(new_sl, 8)))
+                pos_tracker.update_sl(sym, pos["strategy"], round(new_sl, 8))
+
+        pos["bars_held"] = pos.get("bars_held", 0) + 1
+
+    # Step 5: Scan for new setups
+    for sym in sorted(all_symbols):
+        # Fetch candles
+        if sym in candle_cache:
+            cached_df = candle_cache[sym]
+            new_klines = fetch_bitunix_klines(sym, interval="1m", limit=5)
+            if new_klines:
+                new_rows = []
+                for k in new_klines:
+                    ts = k.get("time")
+                    if ts is None:
+                        continue
+                    new_rows.append({
+                        "timestamp": pd.Timestamp(int(ts), unit="ms", tz="UTC"),
+                        "open": float(k.get("open", 0)),
+                        "high": float(k.get("high", 0)),
+                        "low": float(k.get("low", 0)),
+                        "close": float(k.get("close", 0)),
+                        "volume": float(k.get("quoteVol", 0)),
+                    })
+                if new_rows:
+                    new_df = pd.DataFrame(new_rows)
+                    df = pd.concat([cached_df, new_df]).drop_duplicates(
+                        subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+                    if len(df) > MR_WARMUP_BARS + 50:
+                        df = df.tail(MR_WARMUP_BARS + 50).reset_index(drop=True)
+                    candle_cache[sym] = df
+                else:
+                    df = cached_df
+            else:
+                df = cached_df
+        else:
+            df = fetch_klines_paginated(sym, n_bars=MR_WARMUP_BARS)
+            if df is None or len(df) < 200:
+                time.sleep(0.1)
+                continue
+            candle_cache[sym] = df
+
+        # Fetch depth
+        depth_data = fetch_bitunix_depth(sym, limit="max")
+
+        # Detect setups
+        try:
+            found_setups = detect_setups(
+                df, sym, _strategy_cfg, _mr_cfg, _momo_gate_cfg,
+                depth_data=depth_data)
+        except Exception as e:
+            logger.debug("Strategy error %s: %s", sym, e)
+            found_setups = []
+
+        for setup in found_setups:
+            strat = setup["strategy"]
+            if pos_tracker.has_position(sym, strat):
+                continue
+
+            # Cooldown for depth strategies
+            if strat in ("depth", "depth_bounce") and depth_cooldown:
+                cd_key = f"{sym}_{strat}"
+                if cycle_num - depth_cooldown.get(cd_key, -999) < 30:
+                    continue
+
+            # Market condition filter
+            side = setup["side"]
+            if strat == "momentum" and setup.get("dps_total", 0) < 4:
+                continue
+            if not market_cond.is_allowed(strat, side):
+                continue
+
+            # Per-strategy mode: live / dummy / off
+            strat_modes = config.get("strategies", {})
+            strat_mode = strat_modes.get(strat, "off")
+            if strat_mode == "off":
+                continue
+
+            # Max positions check
+            if len(pos_tracker.local_positions) >= trading_cfg["max_positions"]:
+                continue
+
+            stats["setups"] += 1
+
+            # Calculate position size
+            balance_data = client.get_balance(trading_cfg["margin_coin"])
+            available = float(balance_data.get("available", 0))
+            if available <= 0:
+                logger.warning("No available balance")
+                continue
+
+            risk_pct = get_risk_pct(setup, _strategy_cfg)
+            entry_price = setup["entry"]
+            sl_pct = setup["sl_pct"]
+
+            qty = calculate_qty(
+                sym, entry_price, risk_pct, sl_pct,
+                available, trading_cfg["leverage"])
+
+            if float(qty) <= 0:
+                continue
+
+            # Place order
+            order_side = "BUY" if side == "long" else "SELL"
+            tp_price = str(round(setup["tp"], 8))
+            sl_price = str(round(setup["sl"], 8))
+
+            mode_tag = f"[{strat_mode.upper()}]"
+            logger.info("  %s PLACING %s %s %s: qty=%s entry=~%.6g tp=%s sl=%s "
+                        "RR=%.2f DPS=%s [%s]",
+                        mode_tag, strat.upper(), side.upper(), sym, qty,
+                        entry_price, tp_price, sl_price,
+                        setup["rr"], setup.get("dps_total", "?"),
+                        setup.get("dps_confidence", "?"))
+
+            if strat_mode == "dummy":
+                # Log only — no real order
+                setup["order_id"] = f"dummy_{int(time.time())}"
+                setup["qty"] = qty
+                setup["risk_pct"] = risk_pct
+                setup["market_score"] = market_cond.score
+                setup["bars_held"] = 0
+                setup["mode"] = "dummy"
+                pos_tracker.add_position(setup)
+                log_trade(setup, "ENTRY_DUMMY")
+                stats["orders"] += 1
+                logger.info("    DUMMY logged: %s", sym)
+
+            elif strat_mode == "live":
+                result = client.place_order(
+                    symbol=sym,
+                    side=order_side,
+                    qty=qty,
+                    order_type=trading_cfg["order_type"],
+                    tp_price=tp_price,
+                    sl_price=sl_price,
+                    tp_sl_type=trading_cfg["tp_sl_type"],
+                )
+
+                if result.get("code") == 0:
+                    order_id = result.get("data", {}).get("orderId", "?")
+                    setup["order_id"] = order_id
+                    setup["qty"] = qty
+                    setup["risk_pct"] = risk_pct
+                    setup["market_score"] = market_cond.score
+                    setup["bars_held"] = 0
+                    setup["mode"] = "live"
+                    pos_tracker.add_position(setup)
+                    log_trade(setup, "ENTRY_LIVE")
+                    stats["orders"] += 1
+                    logger.info("    ORDER FILLED: %s (id=%s)", sym, order_id)
+                else:
+                    stats["errors"] += 1
+                    logger.error("    ORDER FAILED: %s — %s", sym, result.get("msg"))
+
+            if strat in ("depth", "depth_bounce") and depth_cooldown:
+                depth_cooldown[f"{sym}_{strat}"] = cycle_num
+
+        time.sleep(0.12)
+
+    logger.info("Cycle %d done: %d setups, %d orders, %d errors, %d positions. %s",
+                cycle_num, stats["setups"], stats["orders"], stats["errors"],
+                len(pos_tracker.local_positions), pnl_tracker.summary())
+
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Live Trader")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Simulate orders without executing (default from config)")
+    parser.add_argument("--once", action="store_true",
+                        help="Run one cycle and exit")
+    args = parser.parse_args()
+
+    config = load_config()
+    dry_run = args.dry_run or config.get("safety", {}).get("dry_run", True)
+
+    TRADER_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Initialize client
+    client = BitunixClient(
+        api_key=config["api_key"],
+        api_secret=config["api_secret"],
+        dry_run=dry_run,
+    )
+
+    # Safety confirmation
+    if not dry_run and config.get("safety", {}).get("require_confirmation", True):
+        print("\n" + "=" * 60)
+        print("  LIVE TRADING MODE — REAL MONEY")
+        print("=" * 60)
+        print(f"  Risk per trade: {config['trading']['risk_pct']}%")
+        print(f"  Max positions: {config['trading']['max_positions']}")
+        print(f"  Max daily loss: {config['trading']['max_daily_loss_pct']}%")
+        print(f"  Leverage: {config['trading']['leverage']}x")
+        confirm = input("\n  Type 'CONFIRM' to start: ")
+        if confirm != "CONFIRM":
+            print("Aborted.")
+            return
+
+    # Load approved symbols
+    approved = load_approved_symbols()
+
+    # Initialize trackers
+    pos_tracker = LivePositionTracker(client)
+    pnl_tracker = DailyPnLTracker(config["trading"]["max_daily_loss_pct"])
+    market_cond = MarketCondition()
+    candle_cache = {}
+    depth_cooldown = {}
+
+    mode = "DRY RUN" if dry_run else "LIVE"
+    strat_modes = config.get("strategies", {})
+    logger.info("Starting Live Trader [%s]", mode)
+    logger.info("  Strategies: MR=%s  StrictMR=%s  Momo=%s  Depth=%s  DepthBounce=%s",
+                strat_modes.get("mean_reversion", "off").upper(),
+                strat_modes.get("strict_mr", "off").upper(),
+                strat_modes.get("momentum", "off").upper(),
+                strat_modes.get("depth", "off").upper(),
+                strat_modes.get("depth_bounce", "off").upper())
+    logger.info("  Approved symbols: %d", len(approved))
+    logger.info("  Risk: %.1f%% | Max positions: %d | Leverage: %dx",
+                config["trading"]["risk_pct"],
+                config["trading"]["max_positions"],
+                config["trading"]["leverage"])
+
+    if args.once:
+        trading_cycle(client, pos_tracker, pnl_tracker, config,
+                      candle_cache, depth_cooldown, market_cond,
+                      approved, 1)
+        return
+
+    cycle = 0
+    interval = config["scanning"]["interval_sec"]
+    while True:
+        cycle += 1
+        try:
+            trading_cycle(client, pos_tracker, pnl_tracker, config,
+                          candle_cache, depth_cooldown, market_cond,
+                          approved, cycle)
+        except KeyboardInterrupt:
+            logger.info("Stopped by user")
+            break
+        except Exception as e:
+            logger.error("Cycle error: %s", e, exc_info=True)
+
+        logger.info("Sleeping %ds...", interval)
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    main()

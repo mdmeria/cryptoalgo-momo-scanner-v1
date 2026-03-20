@@ -1,0 +1,38 @@
+{
+  "_comment": "KEEP THIS FILE SECURE — contains API credentials",
+
+  "api_key": "YOUR_API_KEY_HERE",
+  "api_secret": "YOUR_API_SECRET_HERE",
+
+  "trading": {
+    "risk_pct": 1.0,
+    "max_positions": 10,
+    "max_daily_loss_pct": 5.0,
+    "margin_mode": "ISOLATION",
+    "leverage": 5,
+    "order_type": "MARKET",
+    "tp_sl_type": "LAST_PRICE",
+    "margin_coin": "USDT"
+  },
+
+  "strategies": {
+    "_comment": "Mode per strategy: 'live' = real orders, 'dummy' = log only, 'off' = disabled",
+    "mean_reversion": "dummy",
+    "strict_mr": "dummy",
+    "momentum": "dummy",
+    "depth": "dummy",
+    "depth_bounce": "dummy"
+  },
+
+  "scanning": {
+    "interval_sec": 60,
+    "top_n": 60,
+    "min_vol_5m": 200000
+  },
+
+  "safety": {
+    "kill_switch_file": "STOP_TRADING",
+    "require_confirmation": true,
+    "dry_run": false
+  }
+}

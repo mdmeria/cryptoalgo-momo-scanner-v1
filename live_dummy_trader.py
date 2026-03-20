@@ -48,16 +48,21 @@ from live_data_collector import (
     LIVE_DIR,
     BITUNIX_BASE,
 )
-from scan_mean_reversion import (
+from strategies import (
+    StrategyConfig,
     MRSettings,
+    MomoGateSettings,
     check_mr_gates_at_bar,
-)
-from backtest_momo_vwap_grind15_full import (
-    GateSettings as MomoGateSettings,
     check_momo_gates_at_bar,
+    detect_setups,
+    get_risk_pct,
+    check_75pct_tp_rule,
+    MarketCondition,
 )
 
-# Load momentum gate config (same as backtest)
+# Load configs
+_strategy_cfg = StrategyConfig.from_json()
+_mr_cfg = MRSettings()
 _momo_gate_cfg = MomoGateSettings.from_json("momo_gate_settings.json")
 from depth_tp_sl_analyzer import compute_depth_tp_sl
 
@@ -72,15 +77,46 @@ POSITIONS_FILE = TRADER_DIR / "open_positions.json"
 DEPTH_COMPARISON_LOG = TRADER_DIR / "depth_comparison.csv"
 CYCLE_LOG = TRADER_DIR / "cycle_log.csv"
 CLOSED_TRADES_LOG = TRADER_DIR / "closed_trades.csv"
+NEW_COINS_LOG = TRADER_DIR / "new_coins.csv"
+
+# Approved symbols whitelist
+APPROVED_SYMBOLS_FILE = Path("approved_symbols.txt")
+_approved_symbols: set = set()
+_alerted_new_coins: set = set()  # track already-alerted coins to avoid spam
+
+
+def load_approved_symbols() -> set:
+    """Load approved symbols from whitelist file."""
+    if not APPROVED_SYMBOLS_FILE.exists():
+        return set()  # no whitelist = allow all
+    with open(APPROVED_SYMBOLS_FILE) as f:
+        return {line.strip() for line in f if line.strip()}
+
+
+def log_new_coin(symbol: str, volume_5m: float = 0, trades_5m: int = 0):
+    """Log a new coin that's not in the whitelist for manual review."""
+    global _alerted_new_coins
+    if symbol in _alerted_new_coins:
+        return
+    _alerted_new_coins.add(symbol)
+
+    TRADER_DIR.mkdir(parents=True, exist_ok=True)
+    write_header = not NEW_COINS_LOG.exists()
+    ts = datetime.now(timezone.utc).isoformat()
+    with open(NEW_COINS_LOG, "a", encoding="utf-8") as f:
+        if write_header:
+            f.write("timestamp,symbol,volume_5m,trades_5m,status\n")
+        f.write(f"{ts},{symbol},{volume_5m:.0f},{trades_5m},pending\n")
+
+    logger.info("  NEW COIN not in whitelist: %s (vol=$%.0f, trades=%d) — logged for review",
+                symbol, volume_5m, trades_5m)
+
 
 # How many 1m bars we need for each strategy
 MR_WARMUP_BARS = 800    # MR scanner needs up to 720 + buffer
 MOMO_WARMUP_BARS = 400  # Momo needs ~370 bars
 
-# Dummy account settings
-DUMMY_BALANCE = 10000.0  # $10k starting
-STANDARD_RISK_PCT = 1.0  # 1% risk per trade
-DUMMY_RISK_PCT = 0.1     # 0.1% for low-confidence
+# Dummy account settings (loaded from strategy_config.json via _strategy_cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -206,17 +242,58 @@ class PositionManager:
 
             hit = None
             exit_price = None
+            entry = pos["entry"]
+            sl_orig = pos.get("sl_original", pos["sl"])
+            tp = pos["tp"]
+            bars = pos.get("bars_held", 0) + 1
+            pos["bars_held"] = bars
 
+            # Save original SL on first check (for R calculation)
+            if "sl_original" not in pos:
+                pos["sl_original"] = pos["sl"]
+
+            # --- Trail rules: move SL to 0.1R when conditions met ---
+            if not pos.get("sl_trailed", False):
+                if pos["side"] == "long":
+                    r_dist = entry - sl_orig          # 1R distance
+                    target_09r = entry + r_dist * 0.9  # 0.9R onside
+                    new_sl = entry + r_dist * 0.1      # 0.1R onside
+
+                    # Rule 1: price reached 0.9R onside
+                    if current_high >= target_09r:
+                        pos["sl"] = round(new_sl, 8)
+                        pos["sl_trailed"] = True
+
+                    # Rule 2: 60+ bars held and price is onside
+                    elif bars >= 60 and current_close > entry:
+                        pos["sl"] = round(new_sl, 8)
+                        pos["sl_trailed"] = True
+                else:  # short
+                    r_dist = sl_orig - entry           # 1R distance
+                    target_09r = entry - r_dist * 0.9  # 0.9R onside
+                    new_sl = entry - r_dist * 0.1      # 0.1R onside
+
+                    # Rule 1: price reached 0.9R onside
+                    if current_low <= target_09r:
+                        pos["sl"] = round(new_sl, 8)
+                        pos["sl_trailed"] = True
+
+                    # Rule 2: 60+ bars held and price is onside
+                    elif bars >= 60 and current_close < entry:
+                        pos["sl"] = round(new_sl, 8)
+                        pos["sl_trailed"] = True
+
+            # --- Check TP/SL ---
             if pos["side"] == "long":
                 if current_low <= pos["sl"]:
-                    hit = "SL"
+                    hit = "TRAIL_SL" if pos.get("sl_trailed") else "SL"
                     exit_price = pos["sl"]
                 elif current_high >= pos["tp"]:
                     hit = "TP"
                     exit_price = pos["tp"]
             else:  # short
                 if current_high >= pos["sl"]:
-                    hit = "SL"
+                    hit = "TRAIL_SL" if pos.get("sl_trailed") else "SL"
                     exit_price = pos["sl"]
                 elif current_low <= pos["tp"]:
                     hit = "TP"
@@ -226,34 +303,44 @@ class PositionManager:
                 pos["outcome"] = hit
                 pos["exit_price"] = exit_price
                 pos["exit_ts"] = current_ts
-                pos["bars_held"] = pos.get("bars_held", 0) + 1
 
                 if pos["side"] == "long":
-                    pos["pnl_pct"] = (exit_price - pos["entry"]) / pos["entry"] * 100
+                    pos["pnl_pct"] = (exit_price - entry) / entry * 100
                 else:
-                    pos["pnl_pct"] = (pos["entry"] - exit_price) / pos["entry"] * 100
+                    pos["pnl_pct"] = (entry - exit_price) / entry * 100
 
                 pos["pnl_usd"] = pos["pnl_pct"] / 100 * pos.get("position_usd", 0)
                 closed.append(pos)
             else:
-                pos["bars_held"] = pos.get("bars_held", 0) + 1
-
-                # Check max hold time (2 hours = 120 bars)
-                if pos.get("bars_held", 0) >= 120:
-                    pos["outcome"] = "TIMEOUT"
-                    pos["exit_price"] = current_close
-                    pos["exit_ts"] = current_ts
-                    if pos["side"] == "long":
-                        pos["pnl_pct"] = (current_close - pos["entry"]) / pos["entry"] * 100
-                    else:
-                        pos["pnl_pct"] = (pos["entry"] - current_close) / pos["entry"] * 100
-                    pos["pnl_usd"] = pos["pnl_pct"] / 100 * pos.get("position_usd", 0)
-                    closed.append(pos)
-                else:
-                    remaining.append(pos)
+                # No timeout — trail rules keep trade alive
+                remaining.append(pos)
 
         self.positions = remaining
         self._save()
+        return closed
+
+    def close_position(self, symbol: str, strategy: str,
+                       exit_price: float, exit_ts: str,
+                       outcome: str) -> Optional[dict]:
+        """Manually close a specific position. Returns the closed trade dict."""
+        remaining = []
+        closed = None
+        for pos in self.positions:
+            if closed is None and pos["symbol"] == symbol and pos["strategy"] == strategy:
+                pos["outcome"] = outcome
+                pos["exit_price"] = exit_price
+                pos["exit_ts"] = exit_ts
+                if pos["side"] == "long":
+                    pos["pnl_pct"] = (exit_price - pos["entry"]) / pos["entry"] * 100
+                else:
+                    pos["pnl_pct"] = (pos["entry"] - exit_price) / pos["entry"] * 100
+                pos["pnl_usd"] = pos["pnl_pct"] / 100 * pos.get("position_usd", 0)
+                closed = pos
+            else:
+                remaining.append(pos)
+        if closed:
+            self.positions = remaining
+            self._save()
         return closed
 
     def get_all_symbols(self) -> set:
@@ -265,109 +352,18 @@ class PositionManager:
 # MR Setup Detection (live, latest bar)
 # ---------------------------------------------------------------------------
 
-def detect_mr_setup_live(df: pd.DataFrame, symbol: str,
-                          cfg: MRSettings) -> Optional[dict]:
-    """
-    Check if the LATEST bar has an MR setup.
-    Uses the shared check_mr_gates_at_bar() for identical logic
-    between backtest and live trading.
-    """
-    if len(df) < max(cfg.range_max_bars, cfg.noise_lookback_bars, 720) + 10:
-        return None
-
-    df = df.sort_values("timestamp").reset_index(drop=True)
-    i = len(df) - 1  # Latest bar
-
-    result = check_mr_gates_at_bar(df, i, cfg)
-    if not result["passed"]:
-        return None
-
-    # Only take DPS >= 3 (low confidence and above)
-    if result["dps_total"] < 3:
-        return None
-
-    entry_ts = str(df.iloc[i]["timestamp"])
-
-    return {
-        "symbol": symbol,
-        "strategy": "mean_reversion",
-        "timestamp": entry_ts,
-        "side": result["side"],
-        "entry": result["entry"],
-        "sl": result["sl"],
-        "tp": result["tp"],
-        "sl_pct": result["sl_pct"],
-        "tp_pct": result["tp_pct"],
-        "rr": result["rr"],
-        "dps_total": result["dps_total"],
-        "dps_confidence": result["dps_confidence"],
-        "noise_level": result["noise_level"],
-        "touches": result["touches"],
-        "break_pct": result["break_pct"],
-        "range_width_pct": result["range_width_pct"],
-        "range_duration_hrs": result["range_duration_hrs"],
-        "pre_chop_trend": result["pre_chop_trend"],
-        "approach": result["dps_v2_label"],
-        "vol_trend": result["dps_v3_vol_trend"],
-        "range_upper": result["range_upper"],
-        "range_lower": result["range_lower"],
-        "touch_timestamps": result["touch_timestamps"],
-    }
-
-
 # ---------------------------------------------------------------------------
-# Momentum Setup Detection (live, latest bar)
+# Setup Detection — delegates to strategies.py
 # ---------------------------------------------------------------------------
 
-def detect_momo_setup_live(df: pd.DataFrame, symbol: str) -> Optional[dict]:
+def detect_all_setups(df: pd.DataFrame, symbol: str,
+                      depth_data: dict = None) -> list[dict]:
     """
-    Check if the LATEST bars show a momentum setup.
-
-    Uses the same gate-based system as the backtest (check_momo_gates_at_bar)
-    to ensure identical trade detection between backtest and live.
-    DPS scoring is computed inside the shared gate function.
+    Run all enabled strategies on the latest bar.
+    Returns list of setup dicts via the unified strategies module.
     """
-    if len(df) < 500:
-        return None
-
-    df = df.sort_values("timestamp").reset_index(drop=True)
-
-    # Need timestamp-indexed DataFrame for the gate functions
-    df_indexed = df.set_index("timestamp").copy()
-    df_indexed.index = pd.to_datetime(df_indexed.index, utc=True)
-
-    # Check both directions using the shared gate system
-    for direction in ["long", "short"]:
-        result = check_momo_gates_at_bar(df_indexed, direction, _momo_gate_cfg)
-
-        if not result["passed"]:
-            continue
-
-        # DPS filter: only take DPS >= 3
-        if result["dps_total"] < 3:
-            continue
-
-        entry_ts = str(df.iloc[-1]["timestamp"])
-
-        return {
-            "symbol": symbol,
-            "strategy": "momentum",
-            "timestamp": entry_ts,
-            "side": direction,
-            "entry": round(result["entry"], 8),
-            "sl": round(result["sl"], 8),
-            "tp": round(result["tp"], 8),
-            "sl_pct": result["sl_pct"],
-            "tp_pct": result["tp_pct"],
-            "rr": result["rr"],
-            "dps_total": result["dps_total"],
-            "dps_confidence": result["dps_confidence"],
-            "approach": result["approach"],
-            "vol_trend": result["vol_trend"],
-            "duration_hrs": result["duration_hrs"],
-        }
-
-    return None
+    return detect_setups(df, symbol, _strategy_cfg, _mr_cfg, _momo_gate_cfg,
+                         depth_data=depth_data)
 
 
 # ---------------------------------------------------------------------------
@@ -491,9 +487,10 @@ def log_cycle(cycle_num: int, n_coins: int, n_mr_setups: int, n_momo_setups: int
 # Main Trading Cycle
 # ---------------------------------------------------------------------------
 
-def trading_cycle(pos_mgr: PositionManager, mr_cfg: MRSettings,
+def trading_cycle(pos_mgr: PositionManager,
                   min_vol: float, top_n: int, cycle_num: int,
-                  candle_cache: dict) -> dict:
+                  candle_cache: dict, depth_cooldown: dict = None,
+                  market_cond: MarketCondition = None) -> dict:
     """
     Run one trading cycle:
     1. Get active coins from Orion
@@ -514,11 +511,41 @@ def trading_cycle(pos_mgr: PositionManager, mr_cfg: MRSettings,
     # Also include symbols with open positions
     open_syms = pos_mgr.get_all_symbols()
     coin_symbols = {c["symbol"] for c in coins}
+
+    # Filter by approved whitelist (if loaded) — log new coins for review
+    if _approved_symbols:
+        for c in coins:
+            sym = c["symbol"]
+            if sym not in _approved_symbols and sym not in open_syms:
+                log_new_coin(sym, c.get("volume_5m", 0), c.get("trades_5m", 0))
+        coin_symbols = {s for s in coin_symbols if s in _approved_symbols}
+
     all_symbols = coin_symbols | open_syms
 
     stats["coins"] = len(all_symbols)
     logger.info("Cycle %d: %d coins (%d active + %d with positions)",
                 cycle_num, len(all_symbols), len(coin_symbols), len(open_syms - coin_symbols))
+
+    # Step 2: Update market conditions every 120 cycles (~2 hours)
+    if market_cond is not None:
+        if cycle_num == 1 or cycle_num % 120 == 0:
+            # Update BTC
+            btc_sym = "BTCUSDT"
+            btc_df = fetch_klines_paginated(btc_sym, n_bars=MR_WARMUP_BARS)
+            if btc_df is not None and len(btc_df) >= 150:
+                candle_cache[btc_sym] = btc_df
+            if btc_sym in candle_cache:
+                market_cond.update_btc(candle_cache[btc_sym])
+
+            # Update breadth from cached candle data
+            if len(candle_cache) > 10:
+                market_cond.update_breadth(candle_cache)
+
+            logger.info("  %s (updated)", market_cond.summary())
+        else:
+            # Log current score without recalculating
+            if cycle_num % 10 == 0:  # log every 10 cycles to reduce noise
+                logger.info("  %s", market_cond.summary())
 
     for sym in sorted(all_symbols):
         # Step 2: Fetch candles (paginated for enough history)
@@ -568,6 +595,19 @@ def trading_cycle(pos_mgr: PositionManager, mr_cfg: MRSettings,
         # Step 3: Check open positions for TP/SL hits
         closed_trades = pos_mgr.check_tp_sl(sym, current_high, current_low,
                                              current_close, current_ts)
+
+        # Step 3b: Check 75% TP rule for depth_bounce positions
+        for pos in list(pos_mgr.positions):
+            if pos.get("symbol") != sym:
+                continue
+            if pos.get("strategy") != "depth_bounce":
+                continue
+            if check_75pct_tp_rule(pos, current_high, current_low):
+                ct_75 = pos_mgr.close_position(
+                    sym, "depth_bounce", current_close, current_ts, "75PCT_TP")
+                if ct_75:
+                    closed_trades.append(ct_75)
+
         for ct in closed_trades:
             log_closed_trade(ct)
             stats["closed"] += 1
@@ -578,91 +618,114 @@ def trading_cycle(pos_mgr: PositionManager, mr_cfg: MRSettings,
                         ct["strategy"].upper(), ct["side"].upper(), sym,
                         outcome, ct["entry"], ct["exit_price"], pnl)
 
-        # Step 4: Scan for new setups (skip if already have position)
-        # --- Mean Reversion ---
-        mr_setup = None
-        if not pos_mgr.has_position(sym, "mean_reversion") and len(df) >= 750:
-            try:
-                mr_setup = detect_mr_setup_live(df, sym, mr_cfg)
-            except Exception as e:
-                logger.debug("MR scan error %s: %s", sym, e)
+        # Step 4: Fetch depth (used by depth strategy + comparison logging)
+        depth_data = None
+        if _strategy_cfg.enable_depth or True:  # always fetch for comparison
+            depth_data = fetch_bitunix_depth(sym, limit="max")
 
-        if mr_setup:
-            stats["mr_setups"] += 1
+        # Step 5: Scan for new setups via unified strategy module
+        try:
+            found_setups = detect_all_setups(df, sym, depth_data=depth_data)
+        except Exception as e:
+            logger.debug("Strategy scan error %s: %s", sym, e)
+            found_setups = []
 
-            # Determine position size
-            # Force dummy trade if pre-chop trend is unclear (no directional conviction)
-            if mr_setup.get("pre_chop_trend") == "unclear":
-                risk_pct = DUMMY_RISK_PCT
+        for setup in found_setups:
+            strat = setup["strategy"]
+            if pos_mgr.has_position(sym, strat):
+                continue
+
+            # Depth/depth_bounce cooldown: skip if recently traded this symbol
+            if strat in ("depth", "depth_bounce") and depth_cooldown is not None:
+                cd_key = f"{sym}_{strat}"
+                last_cycle = depth_cooldown.get(cd_key, -999)
+                if cycle_num - last_cycle < 30:  # ~30 min cooldown
+                    continue
+
+            # Market condition filter
+            if market_cond is not None:
+                side = setup["side"]
+                # Momo: also enforce DPS >= 4
+                if strat == "momentum" and setup.get("dps_total", 0) < 4:
+                    continue
+                if not market_cond.is_allowed(strat, side):
+                    logger.debug("  SKIPPED %s %s %s: market=%s",
+                                 strat, side, sym, market_cond.summary())
+                    continue
+
+            if strat == "mean_reversion":
+                stats["mr_setups"] += 1
+            elif strat == "depth":
+                stats["mr_setups"] += 1  # count depth in mr stats for now
             else:
-                risk_pct = STANDARD_RISK_PCT if mr_setup["dps_confidence"] in ("max", "high") else DUMMY_RISK_PCT
-            position_usd = DUMMY_BALANCE * risk_pct / 100
+                stats["momo_setups"] += 1
 
-            mr_setup["position_usd"] = round(position_usd, 2)
-            mr_setup["risk_pct"] = risk_pct
-            mr_setup["bars_held"] = 0
+            risk_pct = get_risk_pct(setup, _strategy_cfg)
+            position_usd = _strategy_cfg.dummy_balance * risk_pct / 100
 
-            # Fetch depth for comparison
+            setup["position_usd"] = round(position_usd, 2)
+            setup["risk_pct"] = risk_pct
+            setup["market_score"] = market_cond.score if market_cond else 0
+            setup["bars_held"] = 0
+
+            # Depth comparison (use already-fetched depth_data)
             depth_alt = None
-            depth_data = fetch_bitunix_depth(sym, limit="max")
-            if depth_data:
+            if depth_data and strat != "depth":
                 depth_alt = get_depth_alternative(
                     sym, depth_data, current_close,
-                    mr_setup["side"], "mean_reversion")
+                    setup["side"], strat)
 
-            pos_mgr.open_position(mr_setup)
-            log_trade_entry(mr_setup, depth_alt)
+            pos_mgr.open_position(setup)
+            log_trade_entry(setup, depth_alt)
 
-            logger.info("  NEW MR %s %s: entry=%.6g tp=%.6g(%.2f%%) sl=%.6g(%.2f%%) "
-                        "RR=%.2f DPS=%d [%s]",
-                        mr_setup["side"].upper(), sym,
-                        mr_setup["entry"], mr_setup["tp"], mr_setup["tp_pct"],
-                        mr_setup["sl"], mr_setup["sl_pct"],
-                        mr_setup["rr"], mr_setup["dps_total"],
-                        mr_setup["dps_confidence"])
-            if depth_alt:
-                logger.info("    DEPTH alt: tp=%.6g(%.2f%%) sl=%.6g(%.2f%%) RR=%.2f wall=$%s",
-                            depth_alt["depth_tp"], depth_alt["depth_tp_pct"],
-                            depth_alt["depth_sl"], depth_alt["depth_sl_pct"],
-                            depth_alt["depth_rr"],
-                            f"{depth_alt['depth_sl_wall_usd']:,.0f}")
+            # Set depth/depth_bounce cooldown
+            if strat in ("depth", "depth_bounce") and depth_cooldown is not None:
+                depth_cooldown[f"{sym}_{strat}"] = cycle_num
 
-        # --- Momentum ---
-        momo_setup = None
-        if not pos_mgr.has_position(sym, "momentum") and len(df) >= 370:
-            try:
-                momo_setup = detect_momo_setup_live(df, sym)
-            except Exception as e:
-                logger.debug("Momo scan error %s: %s", sym, e)
-
-        if momo_setup:
-            stats["momo_setups"] += 1
-
-            risk_pct = STANDARD_RISK_PCT if momo_setup["dps_confidence"] in ("max", "high") else DUMMY_RISK_PCT
-            position_usd = DUMMY_BALANCE * risk_pct / 100
-
-            momo_setup["position_usd"] = round(position_usd, 2)
-            momo_setup["risk_pct"] = risk_pct
-            momo_setup["bars_held"] = 0
-
-            depth_alt = None
-            depth_data = fetch_bitunix_depth(sym, limit="max")
-            if depth_data:
-                depth_alt = get_depth_alternative(
-                    sym, depth_data, current_close,
-                    momo_setup["side"], "momentum")
-
-            pos_mgr.open_position(momo_setup)
-            log_trade_entry(momo_setup, depth_alt)
-
-            logger.info("  NEW MOMO %s %s: entry=%.6g tp=%.6g(%.2f%%) sl=%.6g(%.2f%%) "
-                        "RR=%.2f DPS=%d [%s] tier=%s",
-                        momo_setup["side"].upper(), sym,
-                        momo_setup["entry"], momo_setup["tp"], momo_setup["tp_pct"],
-                        momo_setup["sl"], momo_setup["sl_pct"],
-                        momo_setup["rr"], momo_setup["dps_total"],
-                        momo_setup["dps_confidence"],
-                        momo_setup.get("quality_tier", "?"))
+            strat_labels = {"mean_reversion": "MR", "strict_mr": "STRICT_MR",
+                           "momentum": "MOMO", "depth": "DEPTH",
+                           "depth_bounce": "DEPTH_BOUNCE"}
+            strat_label = strat_labels.get(strat, strat.upper())
+            if strat in ("depth", "depth_bounce"):
+                zct_align = setup.get("zct_alignment", "unclear")
+                zct_mr = setup.get("zct_mr_reason", "?")
+                zct_momo = setup.get("zct_momo_reason", "?")
+                logger.info("  NEW %s %s %s: entry=%.6g tp=%.6g(%.2f%%) sl=%.6g(%.2f%%) "
+                            "RR=%.2f align=%s DPS=%d [%s]",
+                            strat_label, setup["side"].upper(), sym,
+                            setup["entry"], setup["tp"], setup["tp_pct"],
+                            setup["sl"], setup["sl_pct"],
+                            setup["rr"], zct_align, setup["dps_total"],
+                            setup["dps_confidence"])
+                if strat == "depth_bounce":
+                    logger.info("    bounce: %s wall=%.6g wick=%.6g | "
+                                "walls: SL=$%s(%.1fx) TP=$%s(%.1fx) | MR:%s Momo:%s",
+                                setup.get("bounce_type", "?"),
+                                setup.get("wall_price", 0),
+                                setup.get("wick_price", 0),
+                                f"{setup.get('sl_wall_usd', 0):,.0f}",
+                                setup.get("sl_wall_strength", 0),
+                                f"{setup.get('tp_wall_usd', 0):,.0f}",
+                                setup.get("tp_wall_strength", 0),
+                                zct_mr, zct_momo)
+                else:
+                    logger.info("    walls: SL=$%s(%.1fx) TP=$%s(%.1fx) | imb=%.3f | MR:%s Momo:%s",
+                                f"{setup.get('sl_wall_usd', 0):,.0f}",
+                                setup.get("sl_wall_strength", 0),
+                                f"{setup.get('tp_wall_usd', 0):,.0f}",
+                                setup.get("tp_wall_strength", 0),
+                                setup.get("imbalance_1pct", 0),
+                                zct_mr, zct_momo)
+            else:
+                tp_src = setup.get("tp_source", "strategy")
+                tp_tag = f" tp_src={tp_src}" if tp_src != "strategy" else ""
+                logger.info("  NEW %s %s %s: entry=%.6g tp=%.6g(%.2f%%) sl=%.6g(%.2f%%) "
+                            "RR=%.2f DPS=%d [%s]%s",
+                            strat_label, setup["side"].upper(), sym,
+                            setup["entry"], setup["tp"], setup["tp_pct"],
+                            setup["sl"], setup["sl_pct"],
+                            setup["rr"], setup["dps_total"],
+                            setup["dps_confidence"], tp_tag)
             if depth_alt:
                 logger.info("    DEPTH alt: tp=%.6g(%.2f%%) sl=%.6g(%.2f%%) RR=%.2f wall=$%s",
                             depth_alt["depth_tp"], depth_alt["depth_tp_pct"],
@@ -705,7 +768,6 @@ def main():
     TRADER_DIR.mkdir(parents=True, exist_ok=True)
 
     pos_mgr = PositionManager()
-    mr_cfg = MRSettings()
 
     if args.status:
         print(f"\n{'=' * 60}")
@@ -754,24 +816,39 @@ def main():
                 print(f"  Avg Depth TP%:    {dc['depth_tp_pct'].mean():.2f}")
         return
 
+    # Load approved symbols whitelist
+    global _approved_symbols
+    _approved_symbols = load_approved_symbols()
+
     logger.info("Starting Live Dummy Trader")
     logger.info("  Interval: %ds | Min vol: $%s | Top N: %d",
                 args.interval, f"{min_vol:,.0f}" if (min_vol := args.min_vol) else "0",
                 args.top_n)
+    logger.info("  Strategies: MR=%s  StrictMR=%s  Momo=%s  Depth=%s  DepthBounce=%s  (min DPS=%d)",
+                "ON" if _strategy_cfg.enable_mean_reversion else "OFF",
+                "ON" if _strategy_cfg.enable_strict_mr else "OFF",
+                "ON" if _strategy_cfg.enable_momentum else "OFF",
+                "ON" if _strategy_cfg.enable_depth else "OFF",
+                "ON" if _strategy_cfg.enable_depth_bounce else "OFF",
+                _strategy_cfg.min_dps_live)
+    logger.info("  Approved symbols: %d (from %s)", len(_approved_symbols),
+                APPROVED_SYMBOLS_FILE if _approved_symbols else "NONE - all allowed")
     logger.info("  Positions file: %s", POSITIONS_FILE)
     logger.info("  Open positions: %d", len(pos_mgr.positions))
 
     candle_cache = {}  # {symbol: DataFrame} - avoids re-fetching full history
+    depth_cooldown = {}  # {symbol: cycle_num} - cooldown for depth re-entry
+    market_cond = MarketCondition()
 
     if args.once:
-        trading_cycle(pos_mgr, mr_cfg, args.min_vol, args.top_n, 1, candle_cache)
+        trading_cycle(pos_mgr, args.min_vol, args.top_n, 1, candle_cache, depth_cooldown, market_cond)
         return
 
     cycle = 0
     while True:
         cycle += 1
         try:
-            trading_cycle(pos_mgr, mr_cfg, args.min_vol, args.top_n, cycle, candle_cache)
+            trading_cycle(pos_mgr, args.min_vol, args.top_n, cycle, candle_cache, depth_cooldown, market_cond)
         except KeyboardInterrupt:
             logger.info("Stopped by user")
             break

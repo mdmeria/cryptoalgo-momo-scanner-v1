@@ -1,0 +1,16 @@
+{
+  "enable_mean_reversion": true,
+  "enable_strict_mr": true,
+  "enable_momentum": true,
+  "enable_depth": true,
+  "enable_depth_bounce": true,
+  "min_dps_live": 3,
+  "dummy_risk_pct": 0.1,
+  "standard_risk_pct": 1.0,
+  "dummy_balance": 10000.0,
+  "max_positions_mr": 10,
+  "max_positions_strict_mr": 10,
+  "max_positions_momo": 10,
+  "max_positions_depth": 10,
+  "max_positions_depth_bounce": 10
+}

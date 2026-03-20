@@ -946,6 +946,252 @@ def check_mr_gates_at_bar(df: pd.DataFrame, bar_idx: int,
 
 
 # ---------------------------------------------------------------------------
+# Strict MR — stricter touch counting
+# ---------------------------------------------------------------------------
+
+def count_level_touches_strict(
+    highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
+    opens: np.ndarray, start_idx: int, end_idx: int,
+    level: float, side: str, opposite_level: float,
+    at_level_pct: float = 0.05,
+    debounce_bars: int = 5,
+) -> dict:
+    """
+    Strict touch counting with two extra rules:
+
+    Rule 1 — Swing-back: Only count a touch if price swung back to the
+             opposite bound (TP side) since the previous touch.  The first
+             touch is always counted.
+
+    Rule 2 — Clean entries: Among the last 3 counted touches, no more than
+             1 candle may have closed beyond the entry-side level.
+
+    Returns the same shape as count_level_touches plus:
+      clean_entries (bool), closes_beyond_count (int).
+    """
+    touches: list[int] = []
+    breaks = 0
+    last_touch_bar = -999
+    at_level_tol = level * at_level_pct / 100.0
+    opp_tol = opposite_level * at_level_pct / 100.0
+
+    # After first touch, track whether price visited the opposite bound
+    visited_opposite = True  # first touch doesn't need swing-back
+
+    for i in range(start_idx, end_idx + 1):
+        # --- track breaks (close beyond entry level) ---
+        if side == "upper":
+            if closes[i] > level + at_level_tol:
+                breaks += 1
+        else:
+            if closes[i] < level - at_level_tol:
+                breaks += 1
+
+        # --- track swing-back to opposite bound ---
+        if len(touches) > 0 and not visited_opposite:
+            if side == "upper":
+                # short entry → price must swing down to lower bound
+                if lows[i] <= opposite_level + opp_tol:
+                    visited_opposite = True
+            else:
+                # long entry → price must swing up to upper bound
+                if highs[i] >= opposite_level - opp_tol:
+                    visited_opposite = True
+
+        # --- debounce ---
+        if i - last_touch_bar < debounce_bars:
+            continue
+
+        # --- check touch ---
+        if side == "upper":
+            wick_touch = highs[i] >= level
+            body_below = closes[i] < level
+            close_at_level = abs(closes[i] - level) <= at_level_tol
+
+            if (wick_touch and body_below) or close_at_level:
+                if visited_opposite:
+                    touches.append(i)
+                    last_touch_bar = i
+                    visited_opposite = False
+        else:  # lower / support
+            wick_touch = lows[i] <= level
+            body_above = closes[i] > level
+            close_at_level = abs(closes[i] - level) <= at_level_tol
+
+            if (wick_touch and body_above) or close_at_level:
+                if visited_opposite:
+                    touches.append(i)
+                    last_touch_bar = i
+                    visited_opposite = False
+
+    # --- Rule 2: last-3 close-beyond check ---
+    last_3 = touches[-3:] if len(touches) >= 3 else touches
+    closes_beyond = 0
+    for idx in last_3:
+        if side == "upper" and closes[idx] >= level:
+            closes_beyond += 1
+        elif side == "lower" and closes[idx] <= level:
+            closes_beyond += 1
+    clean_entries = closes_beyond <= 1
+
+    n_bars = end_idx - start_idx + 1
+    break_pct = breaks / n_bars * 100 if n_bars > 0 else 0
+
+    return {
+        "count": len(touches),
+        "last_touch_idx": touches[-1] if touches else -1,
+        "touch_indices": touches,
+        "break_count": breaks,
+        "break_pct": round(break_pct, 1),
+        "clean_entries": clean_entries,
+        "closes_beyond_count": closes_beyond,
+    }
+
+
+def check_strict_mr_gates_at_bar(
+    df: pd.DataFrame, bar_idx: int, cfg: MRSettings
+) -> dict:
+    """
+    Strict MR gate — identical to check_mr_gates_at_bar but with:
+      1. Swing-back touch counting (price must visit opposite bound between touches)
+      2. Clean-entry filter (≤1 of last 3 touches closed beyond entry level)
+    """
+    closes = df["close"].values
+    highs = df["high"].values
+    lows = df["low"].values
+    opens = df["open"].values
+    i = bar_idx
+
+    # Step 1: Detect choppy range
+    range_info = detect_choppy_range(highs, lows, closes, i, cfg)
+    if range_info is None:
+        return {"passed": False, "reason": "no_range"}
+
+    # Step 2: Pre-chop trend
+    pre_trend = detect_pre_chop_trend(closes, range_info["start_idx"])
+
+    # Step 3: Entry at range boundary
+    entry_info = detect_range_entry(df, i, range_info, cfg)
+    if entry_info is None:
+        return {"passed": False, "reason": "no_entry_trigger"}
+
+    # Filter: side must match pre-chop trend direction
+    if pre_trend["preferred_side"] is not None:
+        if entry_info["side"] != pre_trend["preferred_side"]:
+            return {"passed": False, "reason": "side_vs_pre_trend"}
+
+    # Filter: SMMA 30/120 trend
+    smma30 = pd.Series(closes[:i+1]).ewm(alpha=1.0 / 30, adjust=False).mean().values
+    smma120 = pd.Series(closes[:i+1]).ewm(alpha=1.0 / 120, adjust=False).mean().values
+    window = min(120, i)
+    smma30_slope = (smma30[-1] - smma30[-window]) / smma30[-window] * 100 if window > 0 else 0
+    smma120_slope = (smma120[-1] - smma120[-window]) / smma120[-window] * 100 if window > 0 else 0
+    if smma30_slope > 0 and smma120_slope > 0 and entry_info["side"] == "short":
+        return {"passed": False, "reason": "smma_trend_up_vs_short"}
+    if smma30_slope < 0 and smma120_slope < 0 and entry_info["side"] == "long":
+        return {"passed": False, "reason": "smma_trend_down_vs_long"}
+
+    # Step 4: STRICT touch counting + level integrity
+    entry_side = entry_info["level_side"]
+    opposite_level = (range_info["lower"] if entry_side == "upper"
+                      else range_info["upper"])
+
+    touches = count_level_touches_strict(
+        highs, lows, closes, opens,
+        range_info["start_idx"], i,
+        entry_info["level_price"], entry_side,
+        opposite_level=opposite_level,
+        debounce_bars=cfg.touch_cluster_bars,
+    )
+
+    if touches["count"] < cfg.min_touches:
+        return {"passed": False, "reason": f"touches_{touches['count']}_lt_{cfg.min_touches}"}
+    if touches["break_pct"] > 5.0:
+        return {"passed": False, "reason": "break_pct_too_high"}
+    if not touches["clean_entries"]:
+        return {"passed": False, "reason": f"closes_beyond_{touches['closes_beyond_count']}_in_last3"}
+
+    # Step 5: Last touch recency
+    if touches["last_touch_idx"] < 0:
+        return {"passed": False, "reason": "no_last_touch"}
+    bars_since_last = i - touches["last_touch_idx"]
+    if bars_since_last > cfg.last_touch_max_bars:
+        return {"passed": False, "reason": "last_touch_too_old"}
+
+    # Step 5b: Opposite boundary check
+    opp_check = check_opposite_bound_intact(
+        highs, lows, closes,
+        touches["last_touch_idx"], i,
+        range_info, entry_side)
+    if not opp_check["opposite_intact"]:
+        return {"passed": False, "reason": "opposite_bound_broken"}
+
+    # Step 5c: Post-touch trend contradiction
+    if opp_check["post_touch_trend"] == "bearish" and entry_info["side"] == "long":
+        return {"passed": False, "reason": "post_touch_bearish_vs_long"}
+    if opp_check["post_touch_trend"] == "bullish" and entry_info["side"] == "short":
+        return {"passed": False, "reason": "post_touch_bullish_vs_short"}
+
+    # Step 6: VWAP bands
+    vwap_info = compute_vwap_bands(df, i)
+
+    # Step 7: SL/TP
+    sl_tp = compute_sl_tp(df, i, entry_info["entry_price"],
+                          entry_info["side"], range_info, vwap_info, cfg)
+    if sl_tp is None:
+        return {"passed": False, "reason": "sl_tp_invalid"}
+
+    # Step 8: VWAP clear path
+    vwap_check = check_vwap_clear_path(
+        entry_info["entry_price"], sl_tp["tp"],
+        entry_info["side"], vwap_info)
+    if not vwap_check["vwap_clear"]:
+        return {"passed": False, "reason": f"vwap_blocked_{vwap_check['blocking_band']}"}
+
+    # Step 9: Noise classification
+    noise = classify_noise(closes, i, cfg)
+
+    # Step 10: DPS scoring
+    dps = evaluate_dps(df, i, range_info, entry_info, cfg)
+
+    # Build touch timestamps
+    touch_timestamps = "|".join(
+        str(df.iloc[idx]["timestamp"]) for idx in touches["touch_indices"]
+    )
+
+    return {
+        "passed": True,
+        "reason": "all_gates_passed",
+        "side": entry_info["side"],
+        "entry": round(entry_info["entry_price"], 8),
+        "level_price": round(entry_info["level_price"], 8),
+        "level_side": entry_side,
+        "overshoot_pct": entry_info["overshoot_pct"],
+        "range_upper": round(range_info["upper"], 8),
+        "range_lower": round(range_info["lower"], 8),
+        "range_width_pct": range_info["width_pct"],
+        "range_duration_hrs": range_info["duration_hrs"],
+        "range_containment_pct": range_info["containment_pct"],
+        "range_efficiency": range_info["efficiency"],
+        "touches": touches["count"],
+        "break_count": touches["break_count"],
+        "break_pct": touches["break_pct"],
+        "closes_beyond_count": touches["closes_beyond_count"],
+        "bars_since_last_touch": bars_since_last,
+        "post_touch_trend": opp_check["post_touch_trend"],
+        "pre_chop_trend": pre_trend["trend"],
+        "pre_chop_move_pct": pre_trend["move_pct"],
+        "vwap": vwap_info.get("vwap"),
+        "vwap_upper": vwap_info.get("vwap_upper"),
+        "vwap_lower": vwap_info.get("vwap_lower"),
+        **noise,
+        **dps,
+        **sl_tp,
+        "touch_timestamps": touch_timestamps,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main scanner
 # ---------------------------------------------------------------------------
 
