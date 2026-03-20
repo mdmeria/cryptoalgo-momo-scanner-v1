@@ -466,21 +466,26 @@ class LivePositionTracker:
     def sync_with_exchange(self):
         """Fetch real positions from exchange and sync with local state."""
         exchange_positions = self.client.get_positions()
+
+        # Separate dummy and live positions
+        dummy_positions = [p for p in self.local_positions if p.get("mode") == "dummy"]
+        live_positions = [p for p in self.local_positions if p.get("mode") != "dummy"]
+
         if not exchange_positions:
-            # No positions on exchange — clear local if any were closed
-            closed = self.local_positions[:]
-            self.local_positions = []
+            # No positions on exchange — close all live, keep dummy
+            closed = live_positions[:]
+            self.local_positions = dummy_positions
             self._save_local()
             return closed
 
-        # Map exchange positions by symbol (ignore side — ONE_WAY has one per symbol)
+        # Map exchange positions by symbol
         exchange_map = {}
         for ep in exchange_positions:
             exchange_map[ep['symbol']] = ep
 
         closed = []
-        remaining = []
-        for lp in self.local_positions:
+        remaining = list(dummy_positions)  # always keep dummy
+        for lp in live_positions:
             key = lp['symbol']
             if key in exchange_map:
                 # Still open — update with exchange data

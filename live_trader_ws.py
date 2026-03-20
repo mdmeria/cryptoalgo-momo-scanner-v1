@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import sys
@@ -136,6 +137,10 @@ class WSTrader:
         # Track last processed candle timestamp per symbol
         self._last_candle_ts: dict[str, int] = {}
 
+        # Batch candle processing — collect symbols, process together
+        self._pending_candle_symbols: set[str] = set()
+        self._batch_lock = threading.Lock()
+
         # Pending WS subscriptions (sync -> async bridge)
         self._pending_subscriptions: set[str] = set()
 
@@ -188,9 +193,8 @@ class WSTrader:
         # Wait for WS to connect
         await asyncio.sleep(3)
 
-        # Subscribe to active coins
+        # Subscribe to kline only (depth fetched via REST when needed)
         await self.ws.subscribe_kline(list(self.active_symbols))
-        await self.ws.subscribe_depth(list(self.active_symbols))
 
         # Run periodic tasks alongside WS
         periodic_task = asyncio.create_task(self._periodic_loop())
@@ -202,21 +206,204 @@ class WSTrader:
             self.ws.stop()
 
     async def _periodic_loop(self):
-        """Run periodic tasks in async loop."""
+        """Run periodic tasks + batch candle processing."""
         while True:
             try:
+                # Process batched candle symbols (parallel depth fetch)
+                with self._batch_lock:
+                    symbols_to_check = list(self._pending_candle_symbols)
+                    self._pending_candle_symbols.clear()
+
+                if symbols_to_check:
+                    await self._batch_check_setups(symbols_to_check)
+
+                # Periodic tasks (sync — runs every loop but cheap)
                 self._periodic_tasks()
 
-                # Process pending WS subscriptions
+                # Process pending WS subscriptions (kline only)
                 if self._pending_subscriptions and self.ws.is_connected:
                     syms = list(self._pending_subscriptions)
                     self._pending_subscriptions.clear()
                     await self.ws.subscribe_kline(syms)
-                    await self.ws.subscribe_depth(syms)
                     logger.info("Subscribed %d new symbols via WS", len(syms))
             except Exception as e:
                 logger.error("Periodic task error: %s", e)
-            await asyncio.sleep(10)
+            await asyncio.sleep(2)  # check every 2 seconds for batched candles
+
+    async def _batch_check_setups(self, symbols: list[str]):
+        """Fetch depth for multiple symbols in parallel, then run strategies."""
+        from live_data_collector import fetch_bitunix_depth
+
+        # Filter: skip symbols with existing positions or at max capacity
+        trading_cfg = self.config["trading"]
+        eligible = []
+        for sym in symbols:
+            if sym in self.pos_tracker.get_all_symbols():
+                continue
+            if len(self.pos_tracker.local_positions) >= trading_cfg["max_positions"]:
+                break
+            if sym not in self.candle_cache:
+                continue
+            eligible.append(sym)
+
+        if not eligible:
+            return
+
+        # Parallel depth fetch using asyncio thread pool
+        loop = asyncio.get_event_loop()
+        depth_futures = {
+            sym: loop.run_in_executor(None, fetch_bitunix_depth, sym, "max")
+            for sym in eligible
+        }
+
+        # Await all depth fetches concurrently
+        depth_results = {}
+        for sym, fut in depth_futures.items():
+            try:
+                depth_results[sym] = await asyncio.wait_for(fut, timeout=5)
+            except Exception:
+                depth_results[sym] = None
+
+        logger.info("Batch: %d candles, %d eligible, %d depth fetched in parallel",
+                     len(symbols), len(eligible),
+                     sum(1 for d in depth_results.values() if d))
+
+        # Run strategies for each symbol
+        for sym in eligible:
+            depth_data = depth_results.get(sym)
+            self._check_setup_with_depth(sym, depth_data)
+
+    def _check_setup_with_depth(self, symbol: str, depth_data: dict):
+        """Run strategy on a symbol with pre-fetched depth."""
+        if symbol not in self.candle_cache:
+            return
+
+        with self._lock:
+            if check_kill_switch(self.config):
+                return
+            if self.pnl_tracker.is_limit_hit():
+                return
+
+            trading_cfg = self.config["trading"]
+            df = self.candle_cache[symbol]
+
+            if len(df) < 500:
+                return
+
+            if symbol in self.pos_tracker.get_all_symbols():
+                return
+
+            if len(self.pos_tracker.local_positions) >= trading_cfg["max_positions"]:
+                return
+
+            # Run strategies
+            try:
+                found_setups = detect_setups(
+                    df, symbol, _strategy_cfg, _mr_cfg, _momo_gate_cfg,
+                    depth_data=depth_data)
+            except Exception as e:
+                logger.debug("Strategy error %s: %s", symbol, e)
+                return
+
+            for setup in found_setups:
+                strat = setup["strategy"]
+
+                strat_mode = self.strat_modes.get(strat, "off")
+                if strat_mode == "off":
+                    continue
+
+                if strat in ("depth", "depth_bounce"):
+                    cd_key = f"{symbol}_{strat}"
+                    if time.time() - self.depth_cooldown.get(cd_key, 0) < 1800:
+                        continue
+
+                side = setup["side"]
+                if strat == "momentum" and setup.get("dps_total", 0) < 4:
+                    continue
+                if not self.market_cond.is_allowed(strat, side):
+                    continue
+
+                balance_data = self.client.get_balance(trading_cfg["margin_coin"])
+                available = float(balance_data.get("available", 0))
+                if available <= 0:
+                    continue
+
+                risk_pct = get_risk_pct(setup, _strategy_cfg)
+                entry_price = setup["entry"]
+                sl_pct = setup["sl_pct"]
+
+                qty = calculate_qty(
+                    symbol, entry_price, risk_pct, sl_pct,
+                    available, trading_cfg["leverage"],
+                    self.pairs_info)
+
+                if float(qty) <= 0:
+                    continue
+
+                order_side = "BUY" if side == "long" else "SELL"
+                tp_price = str(round(setup["tp"], 8))
+                sl_price = str(round(setup["sl"], 8))
+
+                mode_tag = f"[{strat_mode.upper()}]"
+                logger.info("  %s %s %s %s: entry=~%.6g tp=%s sl=%s RR=%.2f DPS=%s",
+                            mode_tag, strat.upper(), side.upper(), symbol,
+                            entry_price, tp_price, sl_price,
+                            setup["rr"], setup.get("dps_total", "?"))
+
+                if strat_mode == "dummy":
+                    setup["order_id"] = f"dummy_{int(time.time())}"
+                    setup["qty"] = qty
+                    setup["risk_pct"] = risk_pct
+                    setup["market_score"] = self.market_cond.score
+                    setup["bars_held"] = 0
+                    setup["mode"] = "dummy"
+                    self.pos_tracker.add_position(setup)
+                    log_trade(setup, "ENTRY_DUMMY")
+
+                elif strat_mode == "live":
+                    already_configured = symbol in self._margin_configured
+                    result = self.client.place_order_and_verify(
+                        symbol=symbol, side=order_side, qty=qty,
+                        tp_price=tp_price, sl_price=sl_price,
+                        leverage=trading_cfg["leverage"],
+                        margin_mode=trading_cfg["margin_mode"],
+                        tp_sl_type=trading_cfg["tp_sl_type"],
+                        skip_margin_setup=already_configured)
+
+                    if result.get("success"):
+                        setup["order_id"] = result["order_id"]
+                        setup["exchange_position_id"] = result["position_id"]
+                        setup["qty"] = result.get("filled_qty", qty)
+                        setup["actual_fill"] = result["actual_fill"]
+                        setup["risk_pct"] = risk_pct
+                        setup["market_score"] = self.market_cond.score
+                        setup["bars_held"] = 0
+                        setup["mode"] = "live"
+
+                        if result["actual_fill"] > 0:
+                            slippage = abs(result["actual_fill"] - entry_price) / entry_price * 100
+                            setup["slippage_pct"] = round(slippage, 4)
+                            if slippage > 0.05:
+                                logger.info("    SLIPPAGE: expected=%.6g actual=%.6g (%.3f%%)",
+                                            entry_price, result["actual_fill"], slippage)
+
+                        self.pos_tracker.add_position(setup)
+                        log_trade(setup, "ENTRY_LIVE")
+
+                        logger.info("    FILLED: %s fill=%.6g posId=%s qty=%s",
+                                    symbol, result["actual_fill"],
+                                    result["position_id"] or "?",
+                                    result.get("filled_qty", "?"))
+                    else:
+                        logger.error("    FAILED: %s — %s",
+                                     symbol, result.get("error", "Unknown"))
+
+                if strat in ("depth", "depth_bounce"):
+                    self.depth_cooldown[f"{symbol}_{strat}"] = time.time()
+                    with open(TRADER_DIR / "depth_cooldown.json", "w") as f:
+                        json.dump(self.depth_cooldown, f)
+
+                break
 
     # --- Periodic Tasks (background, not time-critical) ---
 
@@ -314,19 +501,30 @@ class WSTrader:
             time.sleep(0.05)
 
     def _load_initial_candles(self):
-        logger.info("Loading initial candles for %d symbols...", len(self.active_symbols))
+        to_load = [s for s in sorted(self.active_symbols) if s not in self.candle_cache]
+        logger.info("Loading initial candles for %d symbols (%d already cached)...",
+                     len(to_load), len(self.candle_cache))
         loaded = 0
-        for sym in sorted(self.active_symbols):
-            if sym in self.candle_cache:
-                continue
-            df = fetch_klines_paginated(sym, n_bars=MR_WARMUP_BARS)
-            if df is not None and len(df) >= 200:
-                self.candle_cache[sym] = df
-                loaded += 1
+        failed = 0
+        for sym in to_load:
+            try:
+                df = fetch_klines_paginated(sym, n_bars=MR_WARMUP_BARS)
+                if df is not None and len(df) >= 200:
+                    self.candle_cache[sym] = df
+                    loaded += 1
+                else:
+                    failed += 1
+                    logger.debug("Candle fetch %s: got %d bars",
+                                 sym, len(df) if df is not None else 0)
+            except Exception as e:
+                failed += 1
+                logger.debug("Candle fetch %s error: %s", sym, e)
             time.sleep(0.1)
-            if loaded % 20 == 0 and loaded > 0:
-                logger.info("  Loaded %d/%d", loaded, len(self.active_symbols))
-        logger.info("Initial candles loaded: %d symbols", loaded)
+            if (loaded + failed) % 20 == 0:
+                logger.info("  Progress: %d/%d loaded, %d failed",
+                             loaded, len(to_load), failed)
+        logger.info("Initial candles: %d loaded, %d failed, %d total cached",
+                     loaded, failed, len(self.candle_cache))
 
     def _refresh_market_condition(self):
         btc_sym = "BTCUSDT"
@@ -366,8 +564,9 @@ class WSTrader:
                 df = df.tail(MR_WARMUP_BARS + 50).reset_index(drop=True)
             self.candle_cache[symbol] = df
 
-            # Run strategy immediately
-            self._check_setup(symbol)
+            # Queue for batch processing (all candles close at same time)
+            with self._batch_lock:
+                self._pending_candle_symbols.add(symbol)
 
     def _handle_depth(self, symbol: str, depth_data: dict):
         pass  # Cached in ws_client._depth_cache
@@ -432,10 +631,9 @@ class WSTrader:
             if len(self.pos_tracker.local_positions) >= trading_cfg["max_positions"]:
                 return
 
-            # Get depth from WS cache
-            depth_data = self.ws.get_latest_depth(symbol)
-            if not depth_data or not depth_data.get("asks"):
-                depth_data = None
+            # Fetch depth via REST (WS depth only gives 1 level, not enough for walls)
+            from live_data_collector import fetch_bitunix_depth
+            depth_data = fetch_bitunix_depth(symbol, limit="max")
 
             # Run strategies
             try:

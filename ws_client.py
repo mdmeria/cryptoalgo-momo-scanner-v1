@@ -197,9 +197,12 @@ class BitunixWS:
 
         elif "depth" in ch and self.on_depth:
             depth_data = data.get("data", data)
+            # WS uses "a"/"b", REST uses "asks"/"bids" — handle both
+            asks = depth_data.get("a") or depth_data.get("asks", [])
+            bids = depth_data.get("b") or depth_data.get("bids", [])
             self._depth_cache[symbol] = {
-                "asks": depth_data.get("asks", []),
-                "bids": depth_data.get("bids", []),
+                "asks": asks,
+                "bids": bids,
                 "ts": data.get("ts", 0),
             }
             self.on_depth(symbol, self._depth_cache[symbol])
@@ -215,7 +218,7 @@ class BitunixWS:
         for sym in self._kline_symbols:
             args.append({"symbol": sym, "ch": "market_kline_1min"})
         for sym in self._depth_symbols:
-            args.append({"symbol": sym, "ch": "depth_book1"})
+            args.append({"symbol": sym, "ch": "depth_book15"})
         if args:
             await self._public_ws.send(json.dumps({"op": "subscribe", "args": args}))
             logger.info("Subscribed public: %d kline, %d depth",
@@ -283,13 +286,19 @@ class BitunixWS:
         except json.JSONDecodeError:
             return
 
+        # Log everything from private WS for debugging
+        logger.info("Private WS msg: %s", str(message)[:300])
+
         # Heartbeat
         if data.get("op") == "ping":
             return
 
-        # Login response
-        if data.get("op") == "login":
-            if data.get("code") == 0:
+        # Login response — check multiple possible formats
+        op = data.get("op", "")
+        if op == "login" or "login" in str(message).lower():
+            logger.info("Private WS login response: %s", json.dumps(data)[:300])
+            code = data.get("code")
+            if code == 0 or code == "0" or data.get("msg") == "Success":
                 logger.info("Private WS authenticated")
                 # Subscribe to private channels
                 await self._private_ws.send(json.dumps({
@@ -363,16 +372,17 @@ class BitunixWS:
     # --- Start/Stop ---
 
     async def start(self):
-        """Start both public and private WebSocket connections."""
+        """Start WebSocket connections. Private WS disabled for now."""
         self._running = True
         self._loop = asyncio.get_event_loop()
 
         tasks = [asyncio.create_task(self._public_connect())]
-        if self.api_key:
-            tasks.append(asyncio.create_task(self._private_connect()))
+        # Private WS disabled — auth issue needs investigation
+        # REST sync handles position/order updates every 10s instead
+        # if self.api_key:
+        #     tasks.append(asyncio.create_task(self._private_connect()))
 
-        logger.info("WebSocket client starting (public%s)",
-                     " + private" if self.api_key else "")
+        logger.info("WebSocket client starting (public only — REST sync for positions)")
 
         # Run until stopped
         await asyncio.gather(*tasks, return_exceptions=True)
