@@ -324,10 +324,11 @@ class BitunixClient:
     def place_order_and_verify(self, symbol: str, side: str, qty: str,
                                 tp_price: str, sl_price: str,
                                 leverage: int, margin_mode: str = "ISOLATION",
-                                tp_sl_type: str = "LAST_PRICE") -> dict:
+                                tp_sl_type: str = "LAST_PRICE",
+                                skip_margin_setup: bool = False) -> dict:
         """
         Complete order flow:
-        1. Set margin mode + leverage
+        1. Set margin mode + leverage (skip if pre-configured)
         2. Place market order with TP/SL
         3. Wait briefly for fill
         4. Get actual fill price and position ID
@@ -335,8 +336,9 @@ class BitunixClient:
         6. Recalculate TP/SL from actual fill if needed
         Returns dict with all details or empty dict on failure.
         """
-        # Step 1: Ensure margin mode and leverage
-        self.ensure_margin_and_leverage(symbol, leverage, margin_mode)
+        # Step 1: Ensure margin mode and leverage (skip if pre-configured)
+        if not skip_margin_setup:
+            self.ensure_margin_and_leverage(symbol, leverage, margin_mode)
 
         # Step 2: Place order
         result = self.place_order(
@@ -357,16 +359,16 @@ class BitunixClient:
 
         # Step 4: Get actual fill price
         order_detail = self.get_order_detail(symbol, order_id)
-        actual_fill = float(order_detail.get("avgPrice", 0))
-        filled_qty = float(order_detail.get("executedQty", 0))
+        actual_fill = float(order_detail.get("avgPrice") or 0)
+        filled_qty = float(order_detail.get("executedQty") or 0)
         order_status = order_detail.get("status", "UNKNOWN")
 
         if actual_fill <= 0:
             # Retry once
             time.sleep(1)
             order_detail = self.get_order_detail(symbol, order_id)
-            actual_fill = float(order_detail.get("avgPrice", 0))
-            filled_qty = float(order_detail.get("executedQty", 0))
+            actual_fill = float(order_detail.get("avgPrice") or 0)
+            filled_qty = float(order_detail.get("executedQty") or 0)
             order_status = order_detail.get("status", "UNKNOWN")
 
         # Step 5: Get position ID
@@ -705,7 +707,13 @@ def trading_cycle(client: BitunixClient, pos_tracker: LivePositionTracker,
                      outcome, ct["strategy"].upper(), ct["side"].upper(),
                      ct["symbol"], close_price, pnl_pct, realized, fee)
         log_trade(ct, "CLOSED")
-        pnl_tracker.add_trade(pnl_pct)
+        # Track daily PnL using risk_pct (account-relative), not raw price move
+        risk_pct = ct.get("risk_pct", 0.1)
+        if pnl_pct > 0:
+            account_pnl = risk_pct * (pnl_pct / ct.get("sl_pct", 1.0))
+        else:
+            account_pnl = -risk_pct  # lost the risked amount
+        pnl_tracker.add_trade(account_pnl)
 
     # Step 2: Get active coins
     coins = fetch_orion_active_coins(

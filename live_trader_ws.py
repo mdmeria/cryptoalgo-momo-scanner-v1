@@ -119,6 +119,9 @@ class WSTrader:
         # Active symbols being tracked
         self.active_symbols: set[str] = set()
 
+        # Symbols with margin/leverage already configured
+        self._margin_configured: set[str] = set()
+
         # Lock for thread safety (WS callbacks run in separate threads)
         self._lock = threading.Lock()
 
@@ -144,6 +147,9 @@ class WSTrader:
         # Initial candle load for all active coins (need history for strategies)
         self._refresh_active_coins()
         self._load_initial_candles()
+
+        # Pre-configure margin mode + leverage for all active symbols
+        self._preconfigure_margin(self.active_symbols)
 
         # Initial market condition
         self._refresh_market_condition()
@@ -250,11 +256,30 @@ class WSTrader:
                     df = fetch_klines_paginated(sym, n_bars=MR_WARMUP_BARS)
                     if df is not None and len(df) >= 200:
                         self.candle_cache[sym] = df
+            # Pre-configure margin for new symbols
+            self._preconfigure_margin(new_symbols)
             # Subscribe to new symbols
             self.ws.subscribe_kline(list(new_symbols))
             self.ws.subscribe_depth(list(new_symbols))
             logger.info("Added %d symbols (total active: %d)",
                         len(new_symbols), len(self.active_symbols))
+
+    def _preconfigure_margin(self, symbols: set[str]):
+        """Pre-set margin mode + leverage for symbols. Only once per symbol."""
+        trading_cfg = self.config["trading"]
+        leverage = trading_cfg["leverage"]
+        margin_mode = trading_cfg["margin_mode"]
+        to_configure = symbols - self._margin_configured
+
+        if not to_configure or self.dry_run:
+            return
+
+        logger.info("Pre-configuring margin for %d symbols...", len(to_configure))
+        for sym in sorted(to_configure):
+            self.client.ensure_margin_and_leverage(sym, leverage, margin_mode)
+            self._margin_configured.add(sym)
+            time.sleep(0.05)  # light rate limit
+        logger.info("Margin configured: %d symbols", len(self._margin_configured))
 
     def _load_initial_candles(self):
         """Load historical candles for all active symbols (first time)."""
@@ -460,12 +485,15 @@ class WSTrader:
                     log_trade(setup, "ENTRY_DUMMY")
 
                 elif strat_mode == "live":
+                    # Margin already pre-configured on startup/refresh
+                    already_configured = symbol in self._margin_configured
                     result = self.client.place_order_and_verify(
                         symbol=symbol, side=order_side, qty=qty,
                         tp_price=tp_price, sl_price=sl_price,
                         leverage=trading_cfg["leverage"],
                         margin_mode=trading_cfg["margin_mode"],
-                        tp_sl_type=trading_cfg["tp_sl_type"])
+                        tp_sl_type=trading_cfg["tp_sl_type"],
+                        skip_margin_setup=already_configured)
 
                     if result.get("success"):
                         setup["order_id"] = result["order_id"]
