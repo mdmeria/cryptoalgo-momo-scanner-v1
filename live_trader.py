@@ -310,14 +310,17 @@ class BitunixClient:
                                     margin_mode: str = "ISOLATION"):
         """Set margin mode and leverage for a symbol. Safe to call repeatedly."""
         try:
-            self.set_margin_mode(symbol, margin_mode)
-        except Exception:
-            pass  # May fail if already set or position exists
+            result = self.set_margin_mode(symbol, margin_mode)
+            logger.info("    [DEBUG] set_margin_mode(%s, %s): code=%s msg=%s",
+                         symbol, margin_mode, result.get("code"), result.get("msg"))
+        except Exception as e:
+            logger.info("    [DEBUG] set_margin_mode(%s) exception: %s", symbol, e)
         try:
-            self.set_leverage(symbol, leverage, "LONG")
-            self.set_leverage(symbol, leverage, "SHORT")
-        except Exception:
-            pass
+            result = self.set_leverage(symbol, leverage)
+            logger.info("    [DEBUG] set_leverage(%s, %d): code=%s msg=%s",
+                         symbol, leverage, result.get("code"), result.get("msg"))
+        except Exception as e:
+            logger.info("    [DEBUG] set_leverage(%s) exception: %s", symbol, e)
 
     # --- Full Order Flow ---
 
@@ -340,12 +343,18 @@ class BitunixClient:
         if not skip_margin_setup:
             self.ensure_margin_and_leverage(symbol, leverage, margin_mode)
 
-        # Step 2: Place order
+        # Step 2: Place order with TP/SL
+        logger.info("    [DEBUG] Placing %s %s qty=%s tp=%s sl=%s",
+                     side, symbol, qty, tp_price, sl_price)
         result = self.place_order(
             symbol=symbol, side=side, qty=qty,
             order_type="MARKET",
             tp_price=tp_price, sl_price=sl_price,
             tp_sl_type=tp_sl_type)
+
+        logger.info("    [DEBUG] Order response: code=%s msg=%s data=%s",
+                     result.get("code"), result.get("msg"),
+                     str(result.get("data", {}))[:200])
 
         if result.get("code") != 0:
             return {"success": False, "error": result.get("msg", "Unknown")}
@@ -354,74 +363,39 @@ class BitunixClient:
         if not order_id:
             return {"success": False, "error": "No orderId returned"}
 
-        # Step 3: Wait briefly for fill
-        time.sleep(0.5)
+        # Step 3: Wait for fill, get position ID + actual fill price
+        time.sleep(1)
 
-        # Step 4: Get actual fill price
-        order_detail = self.get_order_detail(symbol, order_id)
-        actual_fill = float(order_detail.get("avgPrice") or 0)
-        filled_qty = float(order_detail.get("executedQty") or 0)
-        order_status = order_detail.get("status", "UNKNOWN")
-
-        if actual_fill <= 0:
-            # Retry once
-            time.sleep(1)
-            order_detail = self.get_order_detail(symbol, order_id)
-            actual_fill = float(order_detail.get("avgPrice") or 0)
-            filled_qty = float(order_detail.get("executedQty") or 0)
-            order_status = order_detail.get("status", "UNKNOWN")
-
-        # Step 5: Get position ID
         position_id = None
-        positions = self.get_positions(symbol)
-        side_str = "LONG" if side == "BUY" else "SHORT"
-        for pos in positions:
-            if pos.get("side") == side_str:
-                position_id = pos.get("positionId")
+        actual_fill = 0
+        filled_qty = float(qty)
+        order_status = "FILLED"
+        # ONE_WAY mode: side is BUY/SELL. HEDGE mode: side is LONG/SHORT
+        side_matches = {"BUY", "LONG"} if side == "BUY" else {"SELL", "SHORT"}
+
+        for attempt in range(3):
+            positions = self.get_positions(symbol)
+            logger.info("    [DEBUG] get_positions(%s) attempt %d: %d positions found",
+                         symbol, attempt + 1, len(positions))
+            for pos in positions:
+                if pos.get("side") in side_matches:
+                    position_id = pos.get("positionId")
+                    actual_fill = float(pos.get("avgOpenPrice") or 0)
+                    filled_qty = float(pos.get("qty") or qty)
+                    break
+            if position_id and actual_fill > 0:
+                logger.info("    [DEBUG] Position found: posId=%s fill=%.6g qty=%s",
+                             position_id, actual_fill, filled_qty)
                 break
+            time.sleep(0.5)
 
-        # Step 6: If fill price differs significantly, recalculate TP/SL
+        if not position_id:
+            logger.warning("    [DEBUG] No position found after 3 attempts for %s %s",
+                            side_str, symbol)
+
+        # Log slippage but don't recalculate TP/SL
+        # (recalculation adds duplicate TP/SL orders on exchange)
         recalculated = False
-        if actual_fill > 0 and position_id:
-            expected_entry = float(tp_price if side == "SELL" else sl_price)
-            # We have the original setup entry — check slippage
-            # Recalculate TP/SL based on actual fill
-            orig_tp = float(tp_price)
-            orig_sl = float(sl_price)
-
-            if side == "BUY":  # long
-                orig_entry_approx = orig_sl / (1 - 0.01)  # rough estimate
-                sl_dist = actual_fill - orig_sl
-                tp_dist = orig_tp - actual_fill
-                # If slippage > 0.1%, adjust TP/SL
-                slippage = abs(actual_fill - orig_entry_approx) / actual_fill * 100
-                if slippage > 0.1:
-                    new_sl = actual_fill - sl_dist
-                    new_tp = actual_fill + tp_dist
-                    self.modify_tp_sl(symbol, position_id,
-                                      sl_price=str(round(new_sl, 8)),
-                                      tp_price=str(round(new_tp, 8)),
-                                      qty=str(filled_qty))
-                    recalculated = True
-                    logger.info("    Recalculated TP/SL: fill=%.6g (slippage=%.2f%%) "
-                                "new_tp=%.6g new_sl=%.6g",
-                                actual_fill, slippage, new_tp, new_sl)
-            else:  # short
-                sl_dist = orig_sl - actual_fill
-                tp_dist = actual_fill - orig_tp
-                orig_entry_approx = orig_sl / (1 + 0.01)
-                slippage = abs(actual_fill - orig_entry_approx) / actual_fill * 100
-                if slippage > 0.1:
-                    new_sl = actual_fill + sl_dist
-                    new_tp = actual_fill - tp_dist
-                    self.modify_tp_sl(symbol, position_id,
-                                      sl_price=str(round(new_sl, 8)),
-                                      tp_price=str(round(new_tp, 8)),
-                                      qty=str(filled_qty))
-                    recalculated = True
-                    logger.info("    Recalculated TP/SL: fill=%.6g (slippage=%.2f%%) "
-                                "new_tp=%.6g new_sl=%.6g",
-                                actual_fill, slippage, new_tp, new_sl)
 
         return {
             "success": True,
@@ -435,20 +409,22 @@ class BitunixClient:
 
     # --- Leverage & Margin ---
 
-    def set_leverage(self, symbol: str, leverage: int, side: str = "LONG"):
+    def set_leverage(self, symbol: str, leverage: int, margin_coin: str = "USDT"):
         """Set leverage for a symbol."""
         data = {
             "symbol": symbol,
             "leverage": leverage,
-            "side": side,
+            "marginCoin": margin_coin,
         }
         return self._post("/api/v1/futures/account/change_leverage", data)
 
-    def set_margin_mode(self, symbol: str, mode: str = "ISOLATION"):
+    def set_margin_mode(self, symbol: str, mode: str = "ISOLATION",
+                        margin_coin: str = "USDT"):
         """Set margin mode: ISOLATION or CROSS."""
         data = {
             "symbol": symbol,
             "marginMode": mode,
+            "marginCoin": margin_coin,
         }
         return self._post("/api/v1/futures/account/change_margin_mode", data)
 
@@ -494,8 +470,15 @@ class LivePositionTracker:
         closed = []
         remaining = []
         for lp in self.local_positions:
-            side_str = "LONG" if lp["side"] == "long" else "SHORT"
-            key = f"{lp['symbol']}_{side_str}"
+            # Match both ONE_WAY (BUY/SELL) and HEDGE (LONG/SHORT) formats
+            buy_key = f"{lp['symbol']}_BUY"
+            sell_key = f"{lp['symbol']}_SELL"
+            long_key = f"{lp['symbol']}_LONG"
+            short_key = f"{lp['symbol']}_SHORT"
+            if lp["side"] == "long":
+                key = buy_key if buy_key in exchange_map else long_key
+            else:
+                key = sell_key if sell_key in exchange_map else short_key
             if key in exchange_map:
                 # Still open — update with exchange data
                 ep = exchange_map[key]
@@ -660,10 +643,14 @@ def calculate_qty(symbol: str, entry_price: float, risk_pct: float,
     # With leverage
     qty = position_usd / entry_price
 
-    # Round to base precision
+    # Round to base precision and check minimum
     if pairs_info and symbol in pairs_info:
-        precision = pairs_info[symbol].get("basePrecision", 4)
+        pair = pairs_info[symbol]
+        precision = pair.get("basePrecision", 4)
         qty = round(qty, precision)
+        min_qty = float(pair.get("minTradeVolume", 0))
+        if qty < min_qty:
+            qty = 0  # will be caught by the qty <= 0 check
 
     return str(qty)
 
@@ -769,7 +756,10 @@ def trading_cycle(client: BitunixClient, pos_tracker: LivePositionTracker,
         current_high = float(df.iloc[-1]["high"])
         current_low = float(df.iloc[-1]["low"])
         current_close = float(df.iloc[-1]["close"])
-        entry = pos["entry"]
+        # Use actual fill price if available, otherwise setup entry
+        entry = pos.get("actual_fill") or pos["entry"]
+        if entry <= 0:
+            entry = pos["entry"]
         sl_orig = pos.get("sl_original", pos["sl"])
 
         if pos.get("sl_trailed"):
@@ -796,10 +786,13 @@ def trading_cycle(client: BitunixClient, pos_tracker: LivePositionTracker,
 
         if should_trail:
             pos_id = pos.get("exchange_position_id")
-            if pos_id:
-                logger.info("  TRAIL SL %s %s %s: moving SL to %.6g",
-                            pos["strategy"], pos["side"], sym, new_sl)
-                client.modify_tp_sl(sym, pos_id, sl_price=str(round(new_sl, 8)))
+            pos_qty = pos.get("qty") or pos.get("exchange_qty")
+            if pos_id and pos_qty:
+                logger.info("  TRAIL SL %s %s %s: moving SL to %.6g (entry=%.6g, 0.9R=%.6g)",
+                            pos["strategy"], pos["side"], sym, new_sl, entry, target_09r)
+                client.modify_tp_sl(sym, pos_id,
+                                    sl_price=str(round(new_sl, 8)),
+                                    qty=str(pos_qty))
                 pos_tracker.update_sl(sym, pos["strategy"], round(new_sl, 8))
 
         pos["bars_held"] = pos.get("bars_held", 0) + 1
