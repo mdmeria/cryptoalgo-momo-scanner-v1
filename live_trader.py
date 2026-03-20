@@ -32,12 +32,24 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-handler = logging.StreamHandler(stream=sys.stderr)
-handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s %(message)s",
-                                        datefmt="%H:%M:%S"))
+_log_fmt = logging.Formatter("%(asctime)s %(levelname)-5s %(message)s",
+                              datefmt="%H:%M:%S")
+
+# Console handler
+_console_handler = logging.StreamHandler(stream=sys.stderr)
+_console_handler.setFormatter(_log_fmt)
+
+# File handler
+_log_dir = Path("datasets/live/live_trader")
+_log_dir.mkdir(parents=True, exist_ok=True)
+_file_handler = logging.FileHandler(
+    _log_dir / "trader_log.txt", encoding="utf-8")
+_file_handler.setFormatter(_log_fmt)
+
 logger = logging.getLogger("live_trader")
 logger.setLevel(logging.INFO)
-logger.addHandler(handler)
+logger.addHandler(_console_handler)
+logger.addHandler(_file_handler)
 
 # ---------------------------------------------------------------------------
 # Imports from existing modules (strategy logic unchanged)
@@ -461,24 +473,15 @@ class LivePositionTracker:
             self._save_local()
             return closed
 
-        # Map exchange positions by symbol+side
+        # Map exchange positions by symbol (ignore side — ONE_WAY has one per symbol)
         exchange_map = {}
         for ep in exchange_positions:
-            key = f"{ep['symbol']}_{ep['side']}"
-            exchange_map[key] = ep
+            exchange_map[ep['symbol']] = ep
 
         closed = []
         remaining = []
         for lp in self.local_positions:
-            # Match both ONE_WAY (BUY/SELL) and HEDGE (LONG/SHORT) formats
-            buy_key = f"{lp['symbol']}_BUY"
-            sell_key = f"{lp['symbol']}_SELL"
-            long_key = f"{lp['symbol']}_LONG"
-            short_key = f"{lp['symbol']}_SHORT"
-            if lp["side"] == "long":
-                key = buy_key if buy_key in exchange_map else long_key
-            else:
-                key = sell_key if sell_key in exchange_map else short_key
+            key = lp['symbol']
             if key in exchange_map:
                 # Still open — update with exchange data
                 ep = exchange_map[key]

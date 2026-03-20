@@ -33,12 +33,22 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-handler = logging.StreamHandler(stream=sys.stderr)
-handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s %(message)s",
-                                        datefmt="%H:%M:%S"))
+# Logging — both console and file
+_log_fmt = logging.Formatter("%(asctime)s %(levelname)-5s %(message)s",
+                              datefmt="%H:%M:%S")
+_log_dir = Path("datasets/live/live_trader")
+_log_dir.mkdir(parents=True, exist_ok=True)
+
+_console_handler = logging.StreamHandler(stream=sys.stderr)
+_console_handler.setFormatter(_log_fmt)
+_file_handler = logging.FileHandler(
+    _log_dir / "trader_log.txt", encoding="utf-8")
+_file_handler.setFormatter(_log_fmt)
+
 logger = logging.getLogger("live_ws")
 logger.setLevel(logging.INFO)
-logger.addHandler(handler)
+logger.addHandler(_console_handler)
+logger.addHandler(_file_handler)
 
 # ---------------------------------------------------------------------------
 # Imports
@@ -49,17 +59,18 @@ from live_trader import (
     LivePositionTracker,
     DailyPnLTracker,
     load_config,
-    load_approved_symbols,
     log_trade,
     check_kill_switch,
     calculate_qty,
-    CONFIG_FILE,
     TRADER_DIR,
 )
-from live_dummy_trader import fetch_klines_paginated, MR_WARMUP_BARS
+from live_dummy_trader import (
+    fetch_klines_paginated,
+    load_approved_symbols,
+    MR_WARMUP_BARS,
+)
 from live_data_collector import (
     fetch_orion_active_coins,
-    fetch_bitunix_depth,
     LIVE_DIR,
 )
 from strategies import (
@@ -70,9 +81,6 @@ from strategies import (
     get_risk_pct,
     MarketCondition,
 )
-
-# Override TRADER_DIR for WS trader
-TRADER_DIR = LIVE_DIR / "live_trader"
 
 _strategy_cfg = StrategyConfig.from_json()
 _mr_cfg = MRSettings()
@@ -104,7 +112,7 @@ class WSTrader:
         self.market_cond = MarketCondition()
 
         # Data
-        self.candle_cache: dict[str, pd.DataFrame] = {}  # symbol -> full DF
+        self.candle_cache: dict[str, pd.DataFrame] = {}
         self.approved_symbols = load_approved_symbols()
         self.pairs_info = {}
         self.depth_cooldown: dict[str, float] = {}
@@ -122,17 +130,15 @@ class WSTrader:
         # Symbols with margin/leverage already configured
         self._margin_configured: set[str] = set()
 
-        # Lock for thread safety (WS callbacks run in separate threads)
+        # Lock for thread safety
         self._lock = threading.Lock()
 
-        # Track last processed candle timestamp per symbol to avoid duplicates
+        # Track last processed candle timestamp per symbol
         self._last_candle_ts: dict[str, int] = {}
 
-        # Coin refresh interval
+        # Refresh intervals
         self._last_coin_refresh = 0
-        self._coin_refresh_interval = 120  # seconds
-
-        # Market condition refresh
+        self._coin_refresh_interval = 120  # 2 minutes
         self._last_mkt_refresh = 0
         self._mkt_refresh_interval = 7200  # 2 hours
 
@@ -144,11 +150,11 @@ class WSTrader:
         self.pairs_info = self.client.get_trading_pairs()
         logger.info("Trading pairs loaded: %d", len(self.pairs_info))
 
-        # Initial candle load for all active coins (need history for strategies)
+        # Load active coins + candle history
         self._refresh_active_coins()
         self._load_initial_candles()
 
-        # Pre-configure margin mode + leverage for all active symbols
+        # Pre-configure margin for all active symbols
         self._preconfigure_margin(self.active_symbols)
 
         # Initial market condition
@@ -156,27 +162,26 @@ class WSTrader:
 
         # Start WebSocket
         self.ws.start()
-        time.sleep(2)  # Wait for connection
+        time.sleep(2)
 
         # Subscribe to active coins
         self.ws.subscribe_kline(list(self.active_symbols))
         self.ws.subscribe_depth(list(self.active_symbols))
 
         mode = "DRY RUN" if self.dry_run else "LIVE"
-        strat_modes = self.strat_modes
         logger.info("WebSocket Trader started [%s]", mode)
         logger.info("  Strategies: MR=%s StrictMR=%s Momo=%s Depth=%s DepthBounce=%s",
-                     strat_modes.get("mean_reversion", "off").upper(),
-                     strat_modes.get("strict_mr", "off").upper(),
-                     strat_modes.get("momentum", "off").upper(),
-                     strat_modes.get("depth", "off").upper(),
-                     strat_modes.get("depth_bounce", "off").upper())
+                     self.strat_modes.get("mean_reversion", "off").upper(),
+                     self.strat_modes.get("strict_mr", "off").upper(),
+                     self.strat_modes.get("momentum", "off").upper(),
+                     self.strat_modes.get("depth", "off").upper(),
+                     self.strat_modes.get("depth_bounce", "off").upper())
         logger.info("  Approved: %d | Active: %d | Positions: %d",
                      len(self.approved_symbols), len(self.active_symbols),
                      len(self.pos_tracker.local_positions))
         logger.info("  %s", self.market_cond.summary())
 
-        # Main loop — periodic tasks (coin refresh, market condition, sync)
+        # Main loop — periodic tasks
         try:
             while True:
                 self._periodic_tasks()
@@ -185,22 +190,21 @@ class WSTrader:
             logger.info("Stopped by user")
             self.ws.stop()
 
+    # --- Periodic Tasks (background, not time-critical) ---
+
     def _periodic_tasks(self):
-        """Run periodic tasks (not time-critical)."""
         now = time.time()
 
-        # Kill switch
         if check_kill_switch(self.config):
             logger.warning("KILL SWITCH active")
             return
 
-        # Daily PnL reset
         self.pnl_tracker.reset_if_new_day()
         if self.pnl_tracker.is_limit_hit():
             logger.warning("DAILY LOSS LIMIT: %s", self.pnl_tracker.summary())
             return
 
-        # Refresh active coins every 2 minutes
+        # Refresh coins every 2 min
         if now - self._last_coin_refresh > self._coin_refresh_interval:
             self._refresh_active_coins()
             self._last_coin_refresh = now
@@ -210,22 +214,31 @@ class WSTrader:
             self._refresh_market_condition()
             self._last_mkt_refresh = now
 
-        # Sync positions with exchange (catch any missed closes)
+        # Sync positions (catch missed closes)
         with self._lock:
             closed = self.pos_tracker.sync_with_exchange()
             for ct in closed:
                 outcome = ct.get("outcome", "CLOSED")
-                pnl = ct.get("pnl_pct", 0)
-                logger.info("  SYNC CLOSED: %s %s %s PnL=%.2f%%",
-                            outcome, ct["strategy"], ct["symbol"], pnl)
+                close_price = ct.get("close_price", 0)
+                pnl_pct = ct.get("pnl_pct", 0)
+                realized = ct.get("realized_pnl", 0)
+                fee = ct.get("fee", 0)
+                logger.info("  %s %s %s %s: close=%.6g PnL=%.2f%% realized=$%.2f fee=$%.2f",
+                             outcome, ct["strategy"].upper(), ct["side"].upper(),
+                             ct["symbol"], close_price, pnl_pct, realized, fee)
                 log_trade(ct, "CLOSED")
-                self.pnl_tracker.add_trade(pnl)
+                # Track daily PnL using account-relative risk
+                risk_pct = ct.get("risk_pct", 0.1)
+                if pnl_pct > 0:
+                    account_pnl = risk_pct * (pnl_pct / ct.get("sl_pct", 1.0))
+                else:
+                    account_pnl = -risk_pct
+                self.pnl_tracker.add_trade(account_pnl)
 
-        # Trail SL check for open positions
+        # Trail SL check
         self._check_trail_sl()
 
     def _refresh_active_coins(self):
-        """Refresh list of active coins from Orion screener."""
         scan_cfg = self.config["scanning"]
         coins = fetch_orion_active_coins(
             min_vol_5m=scan_cfg["min_vol_5m"], top_n=scan_cfg["top_n"])
@@ -234,7 +247,7 @@ class WSTrader:
 
         coin_symbols = {c["symbol"] for c in coins}
 
-        # Filter by whitelist, skip likely stocks
+        # Whitelist filter
         if self.approved_symbols:
             for sym in coin_symbols - self.approved_symbols:
                 pair = self.pairs_info.get(sym, {})
@@ -244,45 +257,35 @@ class WSTrader:
                 logger.info("  NEW COIN: %s (not in whitelist)", sym)
             coin_symbols = {s for s in coin_symbols if s in self.approved_symbols}
 
-        # Add symbols with open positions
         open_syms = self.pos_tracker.get_all_symbols()
         new_symbols = (coin_symbols | open_syms) - self.active_symbols
 
         if new_symbols:
             self.active_symbols.update(new_symbols)
-            # Load candles for new symbols
             for sym in new_symbols:
                 if sym not in self.candle_cache:
                     df = fetch_klines_paginated(sym, n_bars=MR_WARMUP_BARS)
                     if df is not None and len(df) >= 200:
                         self.candle_cache[sym] = df
-            # Pre-configure margin for new symbols
             self._preconfigure_margin(new_symbols)
-            # Subscribe to new symbols
             self.ws.subscribe_kline(list(new_symbols))
             self.ws.subscribe_depth(list(new_symbols))
             logger.info("Added %d symbols (total active: %d)",
                         len(new_symbols), len(self.active_symbols))
 
     def _preconfigure_margin(self, symbols: set[str]):
-        """Pre-set margin mode + leverage for symbols. Only once per symbol."""
         trading_cfg = self.config["trading"]
-        leverage = trading_cfg["leverage"]
-        margin_mode = trading_cfg["margin_mode"]
         to_configure = symbols - self._margin_configured
-
         if not to_configure or self.dry_run:
             return
-
         logger.info("Pre-configuring margin for %d symbols...", len(to_configure))
         for sym in sorted(to_configure):
-            self.client.ensure_margin_and_leverage(sym, leverage, margin_mode)
+            self.client.ensure_margin_and_leverage(
+                sym, trading_cfg["leverage"], trading_cfg["margin_mode"])
             self._margin_configured.add(sym)
-            time.sleep(0.05)  # light rate limit
-        logger.info("Margin configured: %d symbols", len(self._margin_configured))
+            time.sleep(0.05)
 
     def _load_initial_candles(self):
-        """Load historical candles for all active symbols (first time)."""
         logger.info("Loading initial candles for %d symbols...", len(self.active_symbols))
         loaded = 0
         for sym in sorted(self.active_symbols):
@@ -298,7 +301,6 @@ class WSTrader:
         logger.info("Initial candles loaded: %d symbols", loaded)
 
     def _refresh_market_condition(self):
-        """Update market condition from BTC + breadth."""
         btc_sym = "BTCUSDT"
         if btc_sym in self.candle_cache:
             self.market_cond.update_btc(self.candle_cache[btc_sym])
@@ -306,13 +308,13 @@ class WSTrader:
             self.market_cond.update_breadth(self.candle_cache)
         logger.info("  %s (updated)", self.market_cond.summary())
 
-    # --- WebSocket Handlers ---
+    # --- WebSocket Handlers (called from WS threads) ---
 
     def _handle_kline(self, symbol: str, candle: dict):
-        """Called on every kline update — this is the hot path."""
+        """Hot path — called on every kline update."""
         ts = candle.get("timestamp", 0)
 
-        # Deduplicate — only process each new candle once
+        # Deduplicate
         last_ts = self._last_candle_ts.get(symbol, 0)
         if ts <= last_ts:
             return
@@ -336,29 +338,24 @@ class WSTrader:
                 df = df.tail(MR_WARMUP_BARS + 50).reset_index(drop=True)
             self.candle_cache[symbol] = df
 
-            # Run strategy check on this symbol immediately
+            # Run strategy immediately
             self._check_setup(symbol)
 
     def _handle_depth(self, symbol: str, depth_data: dict):
-        """Called on depth update — cache for strategy use."""
-        # Just cache it — strategy will use latest depth when triggered by kline
-        pass  # Already cached in ws_client._depth_cache
+        pass  # Cached in ws_client._depth_cache
 
     def _handle_position(self, data: dict):
-        """Called on position events (open/update/close)."""
         event = data.get("event", "")
         symbol = data.get("symbol", "")
         side = data.get("side", "")
-        pnl = float(data.get("realizedPNL", 0))
 
         if event == "CLOSE":
+            pnl = float(data.get("realizedPNL", 0))
             logger.info("  WS POSITION CLOSED: %s %s realized=$%.4f", symbol, side, pnl)
-            # Sync will pick up details on next periodic check
 
         elif event == "OPEN":
             pos_id = data.get("positionId", "")
             logger.info("  WS POSITION OPENED: %s %s posId=%s", symbol, side, pos_id)
-            # Update local position with exchange positionId
             with self._lock:
                 for lp in self.pos_tracker.local_positions:
                     if lp["symbol"] == symbol and not lp.get("exchange_position_id"):
@@ -367,15 +364,12 @@ class WSTrader:
                         break
 
     def _handle_order(self, data: dict):
-        """Called on order events (fill/cancel)."""
-        event = data.get("event", "")
         symbol = data.get("symbol", "")
         status = data.get("orderStatus", "")
-        avg_price = data.get("averagePrice", "0")
+        avg_price = data.get("averagePrice") or "0"
 
         if status == "FILLED":
             logger.info("  WS ORDER FILLED: %s avg=%.6g", symbol, float(avg_price))
-            # Update local position with actual fill price
             with self._lock:
                 for lp in self.pos_tracker.local_positions:
                     if lp["symbol"] == symbol and not lp.get("actual_fill"):
@@ -383,15 +377,14 @@ class WSTrader:
                         self.pos_tracker._save_local()
                         break
 
-    # --- Strategy Execution ---
+    # --- Strategy Execution (called from WS kline handler) ---
 
     def _check_setup(self, symbol: str):
-        """Run strategy gates on a symbol — called on each new candle."""
+        """Run strategy on a symbol — called on each new candle."""
         if symbol not in self.candle_cache:
             return
 
         with self._lock:
-            # Safety checks
             if check_kill_switch(self.config):
                 return
             if self.pnl_tracker.is_limit_hit():
@@ -403,12 +396,20 @@ class WSTrader:
             if len(df) < 500:
                 return
 
-            # Get depth data
+            # One position per coin
+            if symbol in self.pos_tracker.get_all_symbols():
+                return
+
+            # Max positions
+            if len(self.pos_tracker.local_positions) >= trading_cfg["max_positions"]:
+                return
+
+            # Get depth from WS cache
             depth_data = self.ws.get_latest_depth(symbol)
             if not depth_data or not depth_data.get("asks"):
-                depth_data = None  # No WS depth yet, will be None
+                depth_data = None
 
-            # Run all strategies
+            # Run strategies
             try:
                 found_setups = detect_setups(
                     df, symbol, _strategy_cfg, _mr_cfg, _momo_gate_cfg,
@@ -420,16 +421,11 @@ class WSTrader:
             for setup in found_setups:
                 strat = setup["strategy"]
 
-                # Strategy mode check
                 strat_mode = self.strat_modes.get(strat, "off")
                 if strat_mode == "off":
                     continue
 
-                # One position per coin
-                if symbol in self.pos_tracker.get_all_symbols():
-                    continue
-
-                # Cooldown for depth
+                # Cooldown for depth (timestamp-based, 30 min)
                 if strat in ("depth", "depth_bounce"):
                     cd_key = f"{symbol}_{strat}"
                     if time.time() - self.depth_cooldown.get(cd_key, 0) < 1800:
@@ -442,11 +438,7 @@ class WSTrader:
                 if not self.market_cond.is_allowed(strat, side):
                     continue
 
-                # Max positions
-                if len(self.pos_tracker.local_positions) >= trading_cfg["max_positions"]:
-                    continue
-
-                # Calculate position size
+                # Position size
                 balance_data = self.client.get_balance(trading_cfg["margin_coin"])
                 available = float(balance_data.get("available", 0))
                 if available <= 0:
@@ -485,7 +477,6 @@ class WSTrader:
                     log_trade(setup, "ENTRY_DUMMY")
 
                 elif strat_mode == "live":
-                    # Margin already pre-configured on startup/refresh
                     already_configured = symbol in self._margin_configured
                     result = self.client.place_order_and_verify(
                         symbol=symbol, side=order_side, qty=qty,
@@ -505,12 +496,20 @@ class WSTrader:
                         setup["bars_held"] = 0
                         setup["mode"] = "live"
 
+                        if result["actual_fill"] > 0:
+                            slippage = abs(result["actual_fill"] - entry_price) / entry_price * 100
+                            setup["slippage_pct"] = round(slippage, 4)
+                            if slippage > 0.05:
+                                logger.info("    SLIPPAGE: expected=%.6g actual=%.6g (%.3f%%)",
+                                            entry_price, result["actual_fill"], slippage)
+
                         self.pos_tracker.add_position(setup)
                         log_trade(setup, "ENTRY_LIVE")
 
-                        logger.info("    FILLED: %s fill=%.6g posId=%s",
+                        logger.info("    FILLED: %s fill=%.6g posId=%s qty=%s",
                                     symbol, result["actual_fill"],
-                                    result["position_id"] or "?")
+                                    result["position_id"] or "?",
+                                    result.get("filled_qty", "?"))
                     else:
                         logger.error("    FAILED: %s — %s",
                                      symbol, result.get("error", "Unknown"))
@@ -524,7 +523,7 @@ class WSTrader:
                 break  # One setup per symbol per candle
 
     def _check_trail_sl(self):
-        """Check trail SL conditions for open positions."""
+        """Check trail SL for open positions."""
         with self._lock:
             for pos in self.pos_tracker.local_positions:
                 sym = pos["symbol"]
@@ -540,7 +539,11 @@ class WSTrader:
                 current_high = float(df.iloc[-1]["high"])
                 current_low = float(df.iloc[-1]["low"])
                 current_close = float(df.iloc[-1]["close"])
-                entry = pos["entry"]
+
+                # Use actual fill price, not setup entry
+                entry = pos.get("actual_fill") or pos["entry"]
+                if entry <= 0:
+                    entry = pos["entry"]
                 sl_orig = pos.get("sl_original", pos["sl"])
 
                 should_trail = False
@@ -567,11 +570,15 @@ class WSTrader:
 
                 if should_trail:
                     pos_id = pos.get("exchange_position_id")
-                    if pos_id and pos.get("mode") == "live":
-                        logger.info("  TRAIL SL %s %s: SL -> %.6g",
-                                    pos["strategy"], sym, new_sl)
+                    pos_qty = pos.get("qty") or pos.get("exchange_qty")
+                    if pos_id and pos_qty and pos.get("mode") == "live":
+                        logger.info("  TRAIL SL %s %s %s: SL -> %.6g (entry=%.6g, 0.9R=%.6g)",
+                                    pos["strategy"], pos["side"], sym,
+                                    new_sl, entry, target_09r)
                         self.client.modify_tp_sl(
-                            sym, pos_id, sl_price=str(round(new_sl, 8)))
+                            sym, pos_id,
+                            sl_price=str(round(new_sl, 8)),
+                            qty=str(pos_qty))
                     if "sl_original" not in pos:
                         pos["sl_original"] = pos["sl"]
                     pos["sl"] = round(new_sl, 8)
@@ -593,7 +600,6 @@ def main():
     config = load_config()
     dry_run = args.dry_run or config.get("safety", {}).get("dry_run", True)
 
-    # Safety confirmation
     if not dry_run and config.get("safety", {}).get("require_confirmation", True):
         print("\n" + "=" * 60)
         print("  WEBSOCKET LIVE TRADING — REAL MONEY")
