@@ -249,20 +249,22 @@ class WSTrader:
         if not eligible:
             return
 
-        # Parallel depth fetch using asyncio thread pool
+        # Throttled parallel depth fetch (max 8 concurrent to stay under rate limit)
+        semaphore = asyncio.Semaphore(8)
         loop = asyncio.get_event_loop()
-        depth_futures = {
-            sym: loop.run_in_executor(None, fetch_bitunix_depth, sym, "max")
-            for sym in eligible
-        }
-
-        # Await all depth fetches concurrently
         depth_results = {}
-        for sym, fut in depth_futures.items():
-            try:
-                depth_results[sym] = await asyncio.wait_for(fut, timeout=5)
-            except Exception:
-                depth_results[sym] = None
+
+        async def fetch_one(sym):
+            async with semaphore:
+                try:
+                    result = await asyncio.wait_for(
+                        loop.run_in_executor(None, fetch_bitunix_depth, sym, "max"),
+                        timeout=5)
+                    depth_results[sym] = result
+                except Exception:
+                    depth_results[sym] = None
+
+        await asyncio.gather(*[fetch_one(sym) for sym in eligible])
 
         logger.info("Batch: %d candles, %d eligible, %d depth fetched in parallel",
                      len(symbols), len(eligible),

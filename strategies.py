@@ -506,9 +506,16 @@ class MarketCondition:
             return True
 
         elif strategy in ("depth", "depth_bounce"):
-            # Skip extremes entirely
-            if abs(s) >= 3:
+            # At extremes: only allow direction-aligned trades
+            # Score +3: only longs. Score -3: only shorts.
+            if s >= 3 and side == "short":
                 return False
+            if s >= 3 and side == "long":
+                return True
+            if s <= -3 and side == "long":
+                return False
+            if s <= -3 and side == "short":
+                return True
             # Direction filter at ±2
             if s >= 2 and side == "short":
                 return False
