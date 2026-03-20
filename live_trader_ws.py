@@ -1,0 +1,587 @@
+#!/usr/bin/env python3
+"""
+WebSocket-Based Live Trader — Near-zero latency execution.
+
+Architecture:
+  - WebSocket receives real-time 1m candle + depth updates
+  - On each new candle close, immediately runs strategy gates
+  - If setup triggers, places order within milliseconds
+  - Private WS receives instant fill/TP/SL notifications
+  - REST API used only for order placement and initial data load
+
+Usage:
+  python live_trader_ws.py [--dry-run] [--once]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+import time
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+handler = logging.StreamHandler(stream=sys.stderr)
+handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s %(message)s",
+                                        datefmt="%H:%M:%S"))
+logger = logging.getLogger("live_ws")
+logger.setLevel(logging.INFO)
+logger.addHandler(handler)
+
+# ---------------------------------------------------------------------------
+# Imports
+# ---------------------------------------------------------------------------
+from ws_client import BitunixWS
+from live_trader import (
+    BitunixClient,
+    LivePositionTracker,
+    DailyPnLTracker,
+    load_config,
+    load_approved_symbols,
+    log_trade,
+    check_kill_switch,
+    calculate_qty,
+    CONFIG_FILE,
+    TRADER_DIR,
+)
+from live_dummy_trader import fetch_klines_paginated, MR_WARMUP_BARS
+from live_data_collector import (
+    fetch_orion_active_coins,
+    fetch_bitunix_depth,
+    LIVE_DIR,
+)
+from strategies import (
+    StrategyConfig,
+    MRSettings,
+    MomoGateSettings,
+    detect_setups,
+    get_risk_pct,
+    MarketCondition,
+)
+
+# Override TRADER_DIR for WS trader
+TRADER_DIR = LIVE_DIR / "live_trader"
+
+_strategy_cfg = StrategyConfig.from_json()
+_mr_cfg = MRSettings()
+_momo_gate_cfg = MomoGateSettings.from_json("momo_gate_settings.json")
+
+
+class WSTrader:
+    """WebSocket-based live trader with near-zero latency."""
+
+    def __init__(self, config: dict, dry_run: bool = True):
+        self.config = config
+        self.dry_run = dry_run
+        trading_cfg = config["trading"]
+
+        # REST client for orders
+        self.client = BitunixClient(
+            config["api_key"], config["api_secret"], dry_run=dry_run)
+
+        # WebSocket client for real-time data
+        self.ws = BitunixWS(config["api_key"], config["api_secret"])
+        self.ws.on_kline = self._handle_kline
+        self.ws.on_depth = self._handle_depth
+        self.ws.on_position = self._handle_position
+        self.ws.on_order = self._handle_order
+
+        # Position tracking
+        self.pos_tracker = LivePositionTracker(self.client)
+        self.pnl_tracker = DailyPnLTracker(trading_cfg["max_daily_loss_pct"])
+        self.market_cond = MarketCondition()
+
+        # Data
+        self.candle_cache: dict[str, pd.DataFrame] = {}  # symbol -> full DF
+        self.approved_symbols = load_approved_symbols()
+        self.pairs_info = {}
+        self.depth_cooldown: dict[str, float] = {}
+        self.strat_modes = config.get("strategies", {})
+
+        # Load persistent cooldown
+        cooldown_file = TRADER_DIR / "depth_cooldown.json"
+        if cooldown_file.exists():
+            with open(cooldown_file) as f:
+                self.depth_cooldown = json.load(f)
+
+        # Active symbols being tracked
+        self.active_symbols: set[str] = set()
+
+        # Lock for thread safety (WS callbacks run in separate threads)
+        self._lock = threading.Lock()
+
+        # Track last processed candle timestamp per symbol to avoid duplicates
+        self._last_candle_ts: dict[str, int] = {}
+
+        # Coin refresh interval
+        self._last_coin_refresh = 0
+        self._coin_refresh_interval = 120  # seconds
+
+        # Market condition refresh
+        self._last_mkt_refresh = 0
+        self._mkt_refresh_interval = 7200  # 2 hours
+
+    def start(self):
+        """Start the WebSocket trader."""
+        TRADER_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Load trading pairs info
+        self.pairs_info = self.client.get_trading_pairs()
+        logger.info("Trading pairs loaded: %d", len(self.pairs_info))
+
+        # Initial candle load for all active coins (need history for strategies)
+        self._refresh_active_coins()
+        self._load_initial_candles()
+
+        # Initial market condition
+        self._refresh_market_condition()
+
+        # Start WebSocket
+        self.ws.start()
+        time.sleep(2)  # Wait for connection
+
+        # Subscribe to active coins
+        self.ws.subscribe_kline(list(self.active_symbols))
+        self.ws.subscribe_depth(list(self.active_symbols))
+
+        mode = "DRY RUN" if self.dry_run else "LIVE"
+        strat_modes = self.strat_modes
+        logger.info("WebSocket Trader started [%s]", mode)
+        logger.info("  Strategies: MR=%s StrictMR=%s Momo=%s Depth=%s DepthBounce=%s",
+                     strat_modes.get("mean_reversion", "off").upper(),
+                     strat_modes.get("strict_mr", "off").upper(),
+                     strat_modes.get("momentum", "off").upper(),
+                     strat_modes.get("depth", "off").upper(),
+                     strat_modes.get("depth_bounce", "off").upper())
+        logger.info("  Approved: %d | Active: %d | Positions: %d",
+                     len(self.approved_symbols), len(self.active_symbols),
+                     len(self.pos_tracker.local_positions))
+        logger.info("  %s", self.market_cond.summary())
+
+        # Main loop — periodic tasks (coin refresh, market condition, sync)
+        try:
+            while True:
+                self._periodic_tasks()
+                time.sleep(10)
+        except KeyboardInterrupt:
+            logger.info("Stopped by user")
+            self.ws.stop()
+
+    def _periodic_tasks(self):
+        """Run periodic tasks (not time-critical)."""
+        now = time.time()
+
+        # Kill switch
+        if check_kill_switch(self.config):
+            logger.warning("KILL SWITCH active")
+            return
+
+        # Daily PnL reset
+        self.pnl_tracker.reset_if_new_day()
+        if self.pnl_tracker.is_limit_hit():
+            logger.warning("DAILY LOSS LIMIT: %s", self.pnl_tracker.summary())
+            return
+
+        # Refresh active coins every 2 minutes
+        if now - self._last_coin_refresh > self._coin_refresh_interval:
+            self._refresh_active_coins()
+            self._last_coin_refresh = now
+
+        # Refresh market condition every 2 hours
+        if now - self._last_mkt_refresh > self._mkt_refresh_interval:
+            self._refresh_market_condition()
+            self._last_mkt_refresh = now
+
+        # Sync positions with exchange (catch any missed closes)
+        with self._lock:
+            closed = self.pos_tracker.sync_with_exchange()
+            for ct in closed:
+                outcome = ct.get("outcome", "CLOSED")
+                pnl = ct.get("pnl_pct", 0)
+                logger.info("  SYNC CLOSED: %s %s %s PnL=%.2f%%",
+                            outcome, ct["strategy"], ct["symbol"], pnl)
+                log_trade(ct, "CLOSED")
+                self.pnl_tracker.add_trade(pnl)
+
+        # Trail SL check for open positions
+        self._check_trail_sl()
+
+    def _refresh_active_coins(self):
+        """Refresh list of active coins from Orion screener."""
+        scan_cfg = self.config["scanning"]
+        coins = fetch_orion_active_coins(
+            min_vol_5m=scan_cfg["min_vol_5m"], top_n=scan_cfg["top_n"])
+        if not coins:
+            return
+
+        coin_symbols = {c["symbol"] for c in coins}
+
+        # Filter by whitelist, skip likely stocks
+        if self.approved_symbols:
+            for sym in coin_symbols - self.approved_symbols:
+                pair = self.pairs_info.get(sym, {})
+                lev = pair.get("maxLeverage", 999)
+                if isinstance(lev, int) and lev <= 10:
+                    continue
+                logger.info("  NEW COIN: %s (not in whitelist)", sym)
+            coin_symbols = {s for s in coin_symbols if s in self.approved_symbols}
+
+        # Add symbols with open positions
+        open_syms = self.pos_tracker.get_all_symbols()
+        new_symbols = (coin_symbols | open_syms) - self.active_symbols
+
+        if new_symbols:
+            self.active_symbols.update(new_symbols)
+            # Load candles for new symbols
+            for sym in new_symbols:
+                if sym not in self.candle_cache:
+                    df = fetch_klines_paginated(sym, n_bars=MR_WARMUP_BARS)
+                    if df is not None and len(df) >= 200:
+                        self.candle_cache[sym] = df
+            # Subscribe to new symbols
+            self.ws.subscribe_kline(list(new_symbols))
+            self.ws.subscribe_depth(list(new_symbols))
+            logger.info("Added %d symbols (total active: %d)",
+                        len(new_symbols), len(self.active_symbols))
+
+    def _load_initial_candles(self):
+        """Load historical candles for all active symbols (first time)."""
+        logger.info("Loading initial candles for %d symbols...", len(self.active_symbols))
+        loaded = 0
+        for sym in sorted(self.active_symbols):
+            if sym in self.candle_cache:
+                continue
+            df = fetch_klines_paginated(sym, n_bars=MR_WARMUP_BARS)
+            if df is not None and len(df) >= 200:
+                self.candle_cache[sym] = df
+                loaded += 1
+            time.sleep(0.1)
+            if loaded % 20 == 0 and loaded > 0:
+                logger.info("  Loaded %d/%d", loaded, len(self.active_symbols))
+        logger.info("Initial candles loaded: %d symbols", loaded)
+
+    def _refresh_market_condition(self):
+        """Update market condition from BTC + breadth."""
+        btc_sym = "BTCUSDT"
+        if btc_sym in self.candle_cache:
+            self.market_cond.update_btc(self.candle_cache[btc_sym])
+        if len(self.candle_cache) > 10:
+            self.market_cond.update_breadth(self.candle_cache)
+        logger.info("  %s (updated)", self.market_cond.summary())
+
+    # --- WebSocket Handlers ---
+
+    def _handle_kline(self, symbol: str, candle: dict):
+        """Called on every kline update — this is the hot path."""
+        ts = candle.get("timestamp", 0)
+
+        # Deduplicate — only process each new candle once
+        last_ts = self._last_candle_ts.get(symbol, 0)
+        if ts <= last_ts:
+            return
+        self._last_candle_ts[symbol] = ts
+
+        # Append to candle cache
+        if symbol in self.candle_cache:
+            new_row = {
+                "timestamp": pd.Timestamp(ts, unit="ms", tz="UTC"),
+                "open": candle["open"],
+                "high": candle["high"],
+                "low": candle["low"],
+                "close": candle["close"],
+                "volume": candle["volume"],
+            }
+            df = self.candle_cache[symbol]
+            new_df = pd.DataFrame([new_row])
+            df = pd.concat([df, new_df]).drop_duplicates(
+                subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+            if len(df) > MR_WARMUP_BARS + 50:
+                df = df.tail(MR_WARMUP_BARS + 50).reset_index(drop=True)
+            self.candle_cache[symbol] = df
+
+            # Run strategy check on this symbol immediately
+            self._check_setup(symbol)
+
+    def _handle_depth(self, symbol: str, depth_data: dict):
+        """Called on depth update — cache for strategy use."""
+        # Just cache it — strategy will use latest depth when triggered by kline
+        pass  # Already cached in ws_client._depth_cache
+
+    def _handle_position(self, data: dict):
+        """Called on position events (open/update/close)."""
+        event = data.get("event", "")
+        symbol = data.get("symbol", "")
+        side = data.get("side", "")
+        pnl = float(data.get("realizedPNL", 0))
+
+        if event == "CLOSE":
+            logger.info("  WS POSITION CLOSED: %s %s realized=$%.4f", symbol, side, pnl)
+            # Sync will pick up details on next periodic check
+
+        elif event == "OPEN":
+            pos_id = data.get("positionId", "")
+            logger.info("  WS POSITION OPENED: %s %s posId=%s", symbol, side, pos_id)
+            # Update local position with exchange positionId
+            with self._lock:
+                for lp in self.pos_tracker.local_positions:
+                    if lp["symbol"] == symbol and not lp.get("exchange_position_id"):
+                        lp["exchange_position_id"] = pos_id
+                        self.pos_tracker._save_local()
+                        break
+
+    def _handle_order(self, data: dict):
+        """Called on order events (fill/cancel)."""
+        event = data.get("event", "")
+        symbol = data.get("symbol", "")
+        status = data.get("orderStatus", "")
+        avg_price = data.get("averagePrice", "0")
+
+        if status == "FILLED":
+            logger.info("  WS ORDER FILLED: %s avg=%.6g", symbol, float(avg_price))
+            # Update local position with actual fill price
+            with self._lock:
+                for lp in self.pos_tracker.local_positions:
+                    if lp["symbol"] == symbol and not lp.get("actual_fill"):
+                        lp["actual_fill"] = float(avg_price)
+                        self.pos_tracker._save_local()
+                        break
+
+    # --- Strategy Execution ---
+
+    def _check_setup(self, symbol: str):
+        """Run strategy gates on a symbol — called on each new candle."""
+        if symbol not in self.candle_cache:
+            return
+
+        with self._lock:
+            # Safety checks
+            if check_kill_switch(self.config):
+                return
+            if self.pnl_tracker.is_limit_hit():
+                return
+
+            trading_cfg = self.config["trading"]
+            df = self.candle_cache[symbol]
+
+            if len(df) < 500:
+                return
+
+            # Get depth data
+            depth_data = self.ws.get_latest_depth(symbol)
+            if not depth_data or not depth_data.get("asks"):
+                depth_data = None  # No WS depth yet, will be None
+
+            # Run all strategies
+            try:
+                found_setups = detect_setups(
+                    df, symbol, _strategy_cfg, _mr_cfg, _momo_gate_cfg,
+                    depth_data=depth_data)
+            except Exception as e:
+                logger.debug("Strategy error %s: %s", symbol, e)
+                return
+
+            for setup in found_setups:
+                strat = setup["strategy"]
+
+                # Strategy mode check
+                strat_mode = self.strat_modes.get(strat, "off")
+                if strat_mode == "off":
+                    continue
+
+                # One position per coin
+                if symbol in self.pos_tracker.get_all_symbols():
+                    continue
+
+                # Cooldown for depth
+                if strat in ("depth", "depth_bounce"):
+                    cd_key = f"{symbol}_{strat}"
+                    if time.time() - self.depth_cooldown.get(cd_key, 0) < 1800:
+                        continue
+
+                # Market condition filter
+                side = setup["side"]
+                if strat == "momentum" and setup.get("dps_total", 0) < 4:
+                    continue
+                if not self.market_cond.is_allowed(strat, side):
+                    continue
+
+                # Max positions
+                if len(self.pos_tracker.local_positions) >= trading_cfg["max_positions"]:
+                    continue
+
+                # Calculate position size
+                balance_data = self.client.get_balance(trading_cfg["margin_coin"])
+                available = float(balance_data.get("available", 0))
+                if available <= 0:
+                    continue
+
+                risk_pct = get_risk_pct(setup, _strategy_cfg)
+                entry_price = setup["entry"]
+                sl_pct = setup["sl_pct"]
+
+                qty = calculate_qty(
+                    symbol, entry_price, risk_pct, sl_pct,
+                    available, trading_cfg["leverage"],
+                    self.pairs_info)
+
+                if float(qty) <= 0:
+                    continue
+
+                order_side = "BUY" if side == "long" else "SELL"
+                tp_price = str(round(setup["tp"], 8))
+                sl_price = str(round(setup["sl"], 8))
+
+                mode_tag = f"[{strat_mode.upper()}]"
+                logger.info("  %s %s %s %s: entry=~%.6g tp=%s sl=%s RR=%.2f DPS=%s",
+                            mode_tag, strat.upper(), side.upper(), symbol,
+                            entry_price, tp_price, sl_price,
+                            setup["rr"], setup.get("dps_total", "?"))
+
+                if strat_mode == "dummy":
+                    setup["order_id"] = f"dummy_{int(time.time())}"
+                    setup["qty"] = qty
+                    setup["risk_pct"] = risk_pct
+                    setup["market_score"] = self.market_cond.score
+                    setup["bars_held"] = 0
+                    setup["mode"] = "dummy"
+                    self.pos_tracker.add_position(setup)
+                    log_trade(setup, "ENTRY_DUMMY")
+
+                elif strat_mode == "live":
+                    result = self.client.place_order_and_verify(
+                        symbol=symbol, side=order_side, qty=qty,
+                        tp_price=tp_price, sl_price=sl_price,
+                        leverage=trading_cfg["leverage"],
+                        margin_mode=trading_cfg["margin_mode"],
+                        tp_sl_type=trading_cfg["tp_sl_type"])
+
+                    if result.get("success"):
+                        setup["order_id"] = result["order_id"]
+                        setup["exchange_position_id"] = result["position_id"]
+                        setup["qty"] = result.get("filled_qty", qty)
+                        setup["actual_fill"] = result["actual_fill"]
+                        setup["risk_pct"] = risk_pct
+                        setup["market_score"] = self.market_cond.score
+                        setup["bars_held"] = 0
+                        setup["mode"] = "live"
+
+                        self.pos_tracker.add_position(setup)
+                        log_trade(setup, "ENTRY_LIVE")
+
+                        logger.info("    FILLED: %s fill=%.6g posId=%s",
+                                    symbol, result["actual_fill"],
+                                    result["position_id"] or "?")
+                    else:
+                        logger.error("    FAILED: %s — %s",
+                                     symbol, result.get("error", "Unknown"))
+
+                # Set cooldown
+                if strat in ("depth", "depth_bounce"):
+                    self.depth_cooldown[f"{symbol}_{strat}"] = time.time()
+                    with open(TRADER_DIR / "depth_cooldown.json", "w") as f:
+                        json.dump(self.depth_cooldown, f)
+
+                break  # One setup per symbol per candle
+
+    def _check_trail_sl(self):
+        """Check trail SL conditions for open positions."""
+        with self._lock:
+            for pos in self.pos_tracker.local_positions:
+                sym = pos["symbol"]
+                if sym not in self.candle_cache:
+                    continue
+                if pos.get("sl_trailed"):
+                    continue
+
+                df = self.candle_cache[sym]
+                if len(df) == 0:
+                    continue
+
+                current_high = float(df.iloc[-1]["high"])
+                current_low = float(df.iloc[-1]["low"])
+                current_close = float(df.iloc[-1]["close"])
+                entry = pos["entry"]
+                sl_orig = pos.get("sl_original", pos["sl"])
+
+                should_trail = False
+                if pos["side"] == "long":
+                    r_dist = entry - sl_orig
+                    if r_dist <= 0:
+                        continue
+                    target_09r = entry + r_dist * 0.9
+                    new_sl = entry + r_dist * 0.1
+                    if current_high >= target_09r:
+                        should_trail = True
+                    elif pos.get("bars_held", 0) >= 60 and current_close > entry:
+                        should_trail = True
+                else:
+                    r_dist = sl_orig - entry
+                    if r_dist <= 0:
+                        continue
+                    target_09r = entry - r_dist * 0.9
+                    new_sl = entry - r_dist * 0.1
+                    if current_low <= target_09r:
+                        should_trail = True
+                    elif pos.get("bars_held", 0) >= 60 and current_close < entry:
+                        should_trail = True
+
+                if should_trail:
+                    pos_id = pos.get("exchange_position_id")
+                    if pos_id and pos.get("mode") == "live":
+                        logger.info("  TRAIL SL %s %s: SL -> %.6g",
+                                    pos["strategy"], sym, new_sl)
+                        self.client.modify_tp_sl(
+                            sym, pos_id, sl_price=str(round(new_sl, 8)))
+                    if "sl_original" not in pos:
+                        pos["sl_original"] = pos["sl"]
+                    pos["sl"] = round(new_sl, 8)
+                    pos["sl_trailed"] = True
+                    self.pos_tracker._save_local()
+
+                pos["bars_held"] = pos.get("bars_held", 0) + 1
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="WebSocket Live Trader")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    config = load_config()
+    dry_run = args.dry_run or config.get("safety", {}).get("dry_run", True)
+
+    # Safety confirmation
+    if not dry_run and config.get("safety", {}).get("require_confirmation", True):
+        print("\n" + "=" * 60)
+        print("  WEBSOCKET LIVE TRADING — REAL MONEY")
+        print("=" * 60)
+        print(f"  Risk: {config['trading']['risk_pct']}%")
+        print(f"  Max positions: {config['trading']['max_positions']}")
+        print(f"  Leverage: {config['trading']['leverage']}x")
+        print(f"  Near-zero latency mode")
+        confirm = input("\n  Type 'CONFIRM' to start: ")
+        if confirm != "CONFIRM":
+            print("Aborted.")
+            return
+
+    trader = WSTrader(config, dry_run=dry_run)
+    trader.start()
+
+
+if __name__ == "__main__":
+    main()
