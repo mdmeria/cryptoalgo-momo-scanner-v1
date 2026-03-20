@@ -136,37 +136,32 @@ class WSTrader:
         # Track last processed candle timestamp per symbol
         self._last_candle_ts: dict[str, int] = {}
 
+        # Pending WS subscriptions (sync -> async bridge)
+        self._pending_subscriptions: set[str] = set()
+
         # Refresh intervals
         self._last_coin_refresh = 0
         self._coin_refresh_interval = 120  # 2 minutes
         self._last_mkt_refresh = 0
         self._mkt_refresh_interval = 7200  # 2 hours
 
-    def start(self):
-        """Start the WebSocket trader."""
+    async def start(self):
+        """Start the WebSocket trader (async)."""
         TRADER_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Load trading pairs info
+        # Load trading pairs info (REST — sync)
         self.pairs_info = self.client.get_trading_pairs()
         logger.info("Trading pairs loaded: %d", len(self.pairs_info))
 
-        # Load active coins + candle history
+        # Load active coins + candle history (REST — sync)
         self._refresh_active_coins()
         self._load_initial_candles()
 
-        # Pre-configure margin for all active symbols
+        # Pre-configure margin (REST — sync)
         self._preconfigure_margin(self.active_symbols)
 
         # Initial market condition
         self._refresh_market_condition()
-
-        # Start WebSocket
-        self.ws.start()
-        time.sleep(2)
-
-        # Subscribe to active coins
-        self.ws.subscribe_kline(list(self.active_symbols))
-        self.ws.subscribe_depth(list(self.active_symbols))
 
         mode = "DRY RUN" if self.dry_run else "LIVE"
         logger.info("WebSocket Trader started [%s]", mode)
@@ -181,14 +176,47 @@ class WSTrader:
                      len(self.pos_tracker.local_positions))
         logger.info("  %s", self.market_cond.summary())
 
-        # Main loop — periodic tasks
+        # Set up WS callbacks
+        self.ws.on_kline = self._handle_kline
+        self.ws.on_depth = self._handle_depth
+        self.ws.on_position = self._handle_position
+        self.ws.on_order = self._handle_order
+
+        # Start WS + periodic tasks concurrently
+        ws_task = asyncio.create_task(self.ws.start())
+
+        # Wait for WS to connect
+        await asyncio.sleep(3)
+
+        # Subscribe to active coins
+        await self.ws.subscribe_kline(list(self.active_symbols))
+        await self.ws.subscribe_depth(list(self.active_symbols))
+
+        # Run periodic tasks alongside WS
+        periodic_task = asyncio.create_task(self._periodic_loop())
+
         try:
-            while True:
-                self._periodic_tasks()
-                time.sleep(10)
+            await asyncio.gather(ws_task, periodic_task)
         except KeyboardInterrupt:
             logger.info("Stopped by user")
             self.ws.stop()
+
+    async def _periodic_loop(self):
+        """Run periodic tasks in async loop."""
+        while True:
+            try:
+                self._periodic_tasks()
+
+                # Process pending WS subscriptions
+                if self._pending_subscriptions and self.ws.is_connected:
+                    syms = list(self._pending_subscriptions)
+                    self._pending_subscriptions.clear()
+                    await self.ws.subscribe_kline(syms)
+                    await self.ws.subscribe_depth(syms)
+                    logger.info("Subscribed %d new symbols via WS", len(syms))
+            except Exception as e:
+                logger.error("Periodic task error: %s", e)
+            await asyncio.sleep(10)
 
     # --- Periodic Tasks (background, not time-critical) ---
 
@@ -268,8 +296,8 @@ class WSTrader:
                     if df is not None and len(df) >= 200:
                         self.candle_cache[sym] = df
             self._preconfigure_margin(new_symbols)
-            self.ws.subscribe_kline(list(new_symbols))
-            self.ws.subscribe_depth(list(new_symbols))
+            # Queue subscriptions for async processing
+            self._pending_subscriptions.update(new_symbols)
             logger.info("Added %d symbols (total active: %d)",
                         len(new_symbols), len(self.active_symbols))
 
@@ -614,7 +642,7 @@ def main():
             return
 
     trader = WSTrader(config, dry_run=dry_run)
-    trader.start()
+    asyncio.run(trader.start())
 
 
 if __name__ == "__main__":
