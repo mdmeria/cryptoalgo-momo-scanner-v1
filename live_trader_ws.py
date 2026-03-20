@@ -141,6 +141,9 @@ class WSTrader:
         self._pending_candle_symbols: set[str] = set()
         self._batch_lock = threading.Lock()
 
+        # Pending limit orders: {orderId: {symbol, side, tp, sl, qty, setup, placed_at}}
+        self._pending_limit_orders: dict[str, dict] = {}
+
         # Pending WS subscriptions (sync -> async bridge)
         self._pending_subscriptions: set[str] = set()
 
@@ -226,9 +229,79 @@ class WSTrader:
                     self._pending_subscriptions.clear()
                     await self.ws.subscribe_kline(syms)
                     logger.info("Subscribed %d new symbols via WS", len(syms))
+
+                # Manage pending limit orders (3 min expiry)
+                self._manage_pending_orders()
             except Exception as e:
                 logger.error("Periodic task error: %s", e)
             await asyncio.sleep(2)  # check every 2 seconds for batched candles
+
+    def _manage_pending_orders(self):
+        """Check pending limit orders: cancel after 3 min, detect fills."""
+        if not self._pending_limit_orders:
+            return
+
+        now = time.time()
+        to_remove = []
+
+        for order_id, info in self._pending_limit_orders.items():
+            symbol = info["symbol"]
+            elapsed = now - info["placed_at"]
+
+            # Check if filled — look for position on exchange
+            positions = self.client.get_positions(symbol)
+            has_position = len(positions) > 0
+
+            if has_position:
+                # Order filled! Attach TP/SL to the position
+                pos = positions[0]
+                pos_id = pos.get("positionId")
+                fill_price = float(pos.get("avgOpenPrice") or 0)
+                filled_qty = float(pos.get("qty") or 0)
+
+                # Attach TP/SL
+                tp_sl_result = self.client.modify_tp_sl(
+                    symbol, pos_id,
+                    tp_price=info["tp_price"],
+                    sl_price=info["sl_price"],
+                    qty=str(filled_qty))
+
+                setup = info["setup"]
+                setup["order_id"] = order_id
+                setup["exchange_position_id"] = pos_id
+                setup["qty"] = filled_qty
+                setup["actual_fill"] = fill_price
+                setup["risk_pct"] = info["risk_pct"]
+                setup["market_score"] = self.market_cond.score
+                setup["bars_held"] = 0
+                setup["mode"] = "live"
+                setup["slippage_pct"] = 0.0  # limit order = zero slippage
+
+                self.pos_tracker.add_position(setup)
+                log_trade(setup, "ENTRY_LIVE_LIMIT")
+
+                tp_ok = "OK" if tp_sl_result.get("code") == 0 else "FAILED"
+                logger.info("    LIMIT FILLED: %s fill=%.6g posId=%s TP/SL=%s",
+                            symbol, fill_price, pos_id, tp_ok)
+
+                to_remove.append(order_id)
+
+            elif elapsed >= 180:  # 3 minutes
+                # Cancel the order
+                cancel_result = self.client._post(
+                    "/api/v1/futures/trade/cancel_order",
+                    {"symbol": symbol, "orderId": order_id})
+                cancel_code = cancel_result.get("code", -1)
+                if cancel_code == 0:
+                    logger.info("    LIMIT CANCELLED (3min): %s id=%s", symbol, order_id)
+                else:
+                    # Cancel failed — might have just filled
+                    logger.info("    LIMIT CANCEL response: %s %s (may have filled)",
+                                symbol, cancel_result.get("msg"))
+                to_remove.append(order_id)
+
+        for oid in to_remove:
+            self._pending_limit_orders.pop(oid, None)
 
     async def _batch_check_setups(self, symbols: list[str]):
         """Fetch depth for multiple symbols in parallel, then run strategies."""
@@ -236,11 +309,17 @@ class WSTrader:
 
         # Filter: skip symbols with existing positions or at max capacity
         trading_cfg = self.config["trading"]
+        live_positions = [p for p in self.pos_tracker.local_positions if p.get("mode") != "dummy"]
+        # Symbols with pending limit orders
+        pending_syms = {info["symbol"] for info in self._pending_limit_orders.values()}
+
         eligible = []
         for sym in symbols:
             if sym in self.pos_tracker.get_all_symbols():
                 continue
-            if len(self.pos_tracker.local_positions) >= trading_cfg["max_positions"]:
+            if sym in pending_syms:
+                continue
+            if len(live_positions) >= trading_cfg["max_positions"]:
                 break
             if sym not in self.candle_cache:
                 continue
@@ -295,7 +374,8 @@ class WSTrader:
             if symbol in self.pos_tracker.get_all_symbols():
                 return
 
-            if len(self.pos_tracker.local_positions) >= trading_cfg["max_positions"]:
+            live_count = sum(1 for p in self.pos_tracker.local_positions if p.get("mode") != "dummy")
+            if live_count >= trading_cfg["max_positions"]:
                 return
 
             # Run strategies
@@ -364,41 +444,63 @@ class WSTrader:
 
                 elif strat_mode == "live":
                     already_configured = symbol in self._margin_configured
-                    result = self.client.place_order_and_verify(
-                        symbol=symbol, side=order_side, qty=qty,
-                        tp_price=tp_price, sl_price=sl_price,
-                        leverage=trading_cfg["leverage"],
-                        margin_mode=trading_cfg["margin_mode"],
-                        tp_sl_type=trading_cfg["tp_sl_type"],
-                        skip_margin_setup=already_configured)
+                    if not already_configured:
+                        self.client.ensure_margin_and_leverage(
+                            symbol, trading_cfg["leverage"], trading_cfg["margin_mode"])
+                        self._margin_configured.add(symbol)
 
-                    if result.get("success"):
-                        setup["order_id"] = result["order_id"]
-                        setup["exchange_position_id"] = result["position_id"]
-                        setup["qty"] = result.get("filled_qty", qty)
-                        setup["actual_fill"] = result["actual_fill"]
-                        setup["risk_pct"] = risk_pct
-                        setup["market_score"] = self.market_cond.score
-                        setup["bars_held"] = 0
-                        setup["mode"] = "live"
+                    if strat in ("depth", "depth_bounce"):
+                        # LIMIT order for depth — zero slippage, 3 min expiry
+                        limit_price = str(round(entry_price, 8))
+                        result = self.client.place_order(
+                            symbol=symbol, side=order_side, qty=qty,
+                            order_type="LIMIT", price=limit_price)
 
-                        if result["actual_fill"] > 0:
-                            slippage = abs(result["actual_fill"] - entry_price) / entry_price * 100
-                            setup["slippage_pct"] = round(slippage, 4)
-                            if slippage > 0.05:
-                                logger.info("    SLIPPAGE: expected=%.6g actual=%.6g (%.3f%%)",
-                                            entry_price, result["actual_fill"], slippage)
+                        if result.get("code") == 0:
+                            order_id = result["data"]["orderId"]
+                            self._pending_limit_orders[order_id] = {
+                                "symbol": symbol, "side": side,
+                                "order_side": order_side,
+                                "entry_price": entry_price,
+                                "tp_price": tp_price, "sl_price": sl_price,
+                                "qty": qty, "setup": setup,
+                                "risk_pct": risk_pct,
+                                "placed_at": time.time(),
+                                "strat": strat,
+                            }
+                            logger.info("    LIMIT placed: %s id=%s price=%s (3min expiry)",
+                                        symbol, order_id, limit_price)
+                        else:
+                            logger.error("    LIMIT FAILED: %s — %s",
+                                         symbol, result.get("msg"))
 
-                        self.pos_tracker.add_position(setup)
-                        log_trade(setup, "ENTRY_LIVE")
-
-                        logger.info("    FILLED: %s fill=%.6g posId=%s qty=%s",
-                                    symbol, result["actual_fill"],
-                                    result["position_id"] or "?",
-                                    result.get("filled_qty", "?"))
                     else:
-                        logger.error("    FAILED: %s — %s",
-                                     symbol, result.get("error", "Unknown"))
+                        # MARKET order for Momo — immediate fill with TP/SL
+                        result = self.client.place_order_and_verify(
+                            symbol=symbol, side=order_side, qty=qty,
+                            tp_price=tp_price, sl_price=sl_price,
+                            leverage=trading_cfg["leverage"],
+                            margin_mode=trading_cfg["margin_mode"],
+                            tp_sl_type=trading_cfg["tp_sl_type"],
+                            skip_margin_setup=True)
+
+                        if result.get("success"):
+                            setup["order_id"] = result["order_id"]
+                            setup["exchange_position_id"] = result["position_id"]
+                            setup["qty"] = result.get("filled_qty", qty)
+                            setup["actual_fill"] = result["actual_fill"]
+                            setup["risk_pct"] = risk_pct
+                            setup["market_score"] = self.market_cond.score
+                            setup["bars_held"] = 0
+                            setup["mode"] = "live"
+                            self.pos_tracker.add_position(setup)
+                            log_trade(setup, "ENTRY_LIVE")
+                            logger.info("    FILLED: %s fill=%.6g posId=%s",
+                                        symbol, result["actual_fill"],
+                                        result["position_id"] or "?")
+                        else:
+                            logger.error("    FAILED: %s — %s",
+                                         symbol, result.get("error", "Unknown"))
 
                 if strat in ("depth", "depth_bounce"):
                     self.depth_cooldown[f"{symbol}_{strat}"] = time.time()
@@ -630,7 +732,8 @@ class WSTrader:
                 return
 
             # Max positions
-            if len(self.pos_tracker.local_positions) >= trading_cfg["max_positions"]:
+            live_count = sum(1 for p in self.pos_tracker.local_positions if p.get("mode") != "dummy")
+            if live_count >= trading_cfg["max_positions"]:
                 return
 
             # Fetch depth via REST (WS depth only gives 1 level, not enough for walls)
