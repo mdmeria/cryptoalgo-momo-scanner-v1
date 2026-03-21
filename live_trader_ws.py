@@ -660,19 +660,19 @@ class WSTrader:
     # --- WebSocket Handlers (called from WS threads) ---
 
     def _handle_kline(self, symbol: str, candle: dict):
-        """Called on every kline update — only process on NEW candle (previous bar closed)."""
+        """Called on every kline update — only process when MINUTE changes."""
         ts = candle.get("timestamp", 0)
 
-        # Only process when we see a NEW candle timestamp
-        # This means the PREVIOUS candle just closed
-        last_ts = self._last_candle_ts.get(symbol, 0)
-        if ts <= last_ts:
-            # Same candle updating — skip (mid-candle tick)
+        # Round to minute — only process when a new minute starts
+        ts_minute = (ts // 60000) * 60000  # floor to minute boundary (ms)
+        last_minute = self._last_candle_ts.get(symbol, 0)
+        if ts_minute <= last_minute:
+            # Same minute — mid-candle tick, skip
             return
 
-        # New candle started — the previous candle is now CLOSED
-        self._last_candle_ts[symbol] = ts
-        logger.debug("New candle: %s ts=%d", symbol, ts)
+        # New minute — previous candle is CLOSED
+        self._last_candle_ts[symbol] = ts_minute
+        logger.debug("Candle closed: %s minute=%d", symbol, ts_minute)
 
         # Append the new candle to cache
         if symbol in self.candle_cache:
