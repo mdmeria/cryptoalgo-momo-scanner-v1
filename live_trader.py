@@ -610,7 +610,7 @@ class DailyPnLTracker:
 # ---------------------------------------------------------------------------
 
 _TRADE_COLUMNS = [
-    "action", "timestamp", "symbol", "strategy", "side",
+    "action", "timestamp_utc", "timestamp_est", "symbol", "strategy", "side",
     "entry", "actual_fill", "tp", "sl", "sl_pct", "tp_pct", "rr",
     "qty", "risk_pct", "mode", "market_score",
     "dps_total", "dps_confidence",
@@ -625,7 +625,24 @@ _TRADE_COLUMNS = [
 
 def log_trade(trade: dict, action: str):
     """Log trade to CSV with fixed columns."""
+    from datetime import datetime, timezone, timedelta
+
     TRADER_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Ensure timestamps exist
+    now_utc = datetime.now(timezone.utc)
+    now_est = now_utc - timedelta(hours=4)
+    if "timestamp" not in trade or not trade["timestamp"]:
+        trade["timestamp"] = now_utc.isoformat()
+    trade["timestamp_utc"] = trade.get("timestamp", now_utc.isoformat())
+    try:
+        utc_ts = pd.Timestamp(trade["timestamp_utc"])
+        trade["timestamp_est"] = str(utc_ts - pd.Timedelta(hours=4))[:19]
+        trade["timestamp_utc"] = str(utc_ts)[:19]
+    except Exception:
+        trade["timestamp_utc"] = str(now_utc)[:19]
+        trade["timestamp_est"] = str(now_est)[:19]
+
     write_header = not TRADES_LOG.exists()
     with open(TRADES_LOG, "a", encoding="utf-8") as f:
         if write_header:
