@@ -878,7 +878,10 @@ class WSTrader:
                 break  # One setup per symbol per candle
 
     def _check_trail_sl(self):
-        """Check trail SL for open positions."""
+        """Trail SL disabled — rely on exchange TP/SL only.
+        Will revisit with better logic later."""
+        return
+        # --- DISABLED ---
         with self._lock:
             for pos in self.pos_tracker.local_positions:
                 sym = pos["symbol"]
