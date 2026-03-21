@@ -176,7 +176,7 @@ class DepthWatchlistSettings:
     min_wall_usd: float = 5000.0      # Min wall USD
     min_imbalance: float = 0.05       # Min depth imbalance for direction
     min_rr: float = 1.5               # Min RR (should be higher since better entry)
-    sl_buffer_pct: float = 0.3        # SL placed this % beyond entry wall
+    sl_buffer_pct: float = 1.0        # SL placed this % beyond entry wall (min 1%)
     tp_buffer_pct: float = 0.1        # TP placed this % before TP wall
     max_watch_minutes: int = 30       # Max time to wait for price to reach wall
     max_distance_pct: float = 2.0     # Max distance from current price to entry wall
@@ -354,19 +354,19 @@ def check_wall_touch(candle: dict, entry_wall_price: float, side: str,
     close = candle["close"]
 
     if side == "long":
-        # Want price to dip DOWN to support wall, then close above it
+        # Want price to dip DOWN to support wall, then close at or above it
         if low <= entry_wall_price:
-            if close > entry_wall_price:
-                return "confirmed"  # wick touched, close above = wall held
+            if close >= entry_wall_price:
+                return "confirmed"  # wick touched, close at/above = wall held
             else:
                 return "broken"  # closed below wall = broken
         return "waiting"
 
     else:  # short
-        # Want price to rise UP to resistance wall, then close below it
+        # Want price to rise UP to resistance wall, then close at or below it
         if high >= entry_wall_price:
-            if close < entry_wall_price:
-                return "confirmed"  # wick touched, close below = wall held
+            if close <= entry_wall_price:
+                return "confirmed"  # wick touched, close at/below = wall held
             else:
                 return "broken"  # closed above wall = broken
         return "waiting"

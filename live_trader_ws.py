@@ -550,10 +550,18 @@ class WSTrader:
         for symbol, wl in self._depth_watchlist.items():
             elapsed_min = (now - wl["created_at"]) / 60
 
-            # Log watchlist status
+            # Log watchlist status with real-time distance
+            live_dist = wl["distance_pct"]  # default to original
+            if symbol in self.candle_cache and len(self.candle_cache[symbol]) >= 2:
+                cur_price = float(self.candle_cache[symbol].iloc[-2]["close"])
+                if cur_price > 0:
+                    if wl["side"] == "long":
+                        live_dist = (cur_price - wl["entry_wall_price"]) / cur_price * 100
+                    else:
+                        live_dist = (wl["entry_wall_price"] - cur_price) / cur_price * 100
             logger.info("  WATCH %s %s: wall=%.6g dist=%.2f%% waiting=%.0fmin",
                         wl["side"].upper(), symbol,
-                        wl["entry_wall_price"], wl["distance_pct"], elapsed_min)
+                        wl["entry_wall_price"], live_dist, elapsed_min)
 
             # Expired?
             max_watch = wl.get("max_watch_minutes", 30)
