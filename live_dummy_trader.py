@@ -30,12 +30,22 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-handler = logging.StreamHandler(stream=sys.stderr)
-handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s %(message)s",
-                                        datefmt="%H:%M:%S"))
+_log_fmt = logging.Formatter("%(asctime)s %(levelname)-5s %(message)s",
+                              datefmt="%H:%M:%S")
+
+_console_handler = logging.StreamHandler(stream=sys.stderr)
+_console_handler.setFormatter(_log_fmt)
+
+_dummy_log_dir = Path("datasets/live/dummy_trader")
+_dummy_log_dir.mkdir(parents=True, exist_ok=True)
+_file_handler = logging.FileHandler(
+    _dummy_log_dir / "trader_log.txt", encoding="utf-8")
+_file_handler.setFormatter(_log_fmt)
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-logger.addHandler(handler)
+logger.addHandler(_console_handler)
+logger.addHandler(_file_handler)
 
 # ---------------------------------------------------------------------------
 # Imports from existing modules
