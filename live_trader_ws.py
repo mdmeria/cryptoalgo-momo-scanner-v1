@@ -887,10 +887,12 @@ class WSTrader:
                 if pos.get("sl_trailed"):
                     continue
 
-                df = self.candle_cache[sym]
-                if len(df) == 0:
+                full_df = self.candle_cache[sym]
+                if len(full_df) < 2:
                     continue
 
+                # Use CLOSED bars only (exclude current incomplete candle)
+                df = full_df.iloc[:-1]
                 current_high = float(df.iloc[-1]["high"])
                 current_low = float(df.iloc[-1]["low"])
                 current_close = float(df.iloc[-1]["close"])
@@ -901,6 +903,20 @@ class WSTrader:
                     entry = pos["entry"]
                 sl_orig = pos.get("sl_original", pos["sl"])
 
+                # bars_held: use time-based counting (minutes since entry)
+                entry_ts = pos.get("timestamp", "")
+                if entry_ts:
+                    try:
+                        import pandas as _pd
+                        entry_time = _pd.Timestamp(entry_ts)
+                        now_time = _pd.Timestamp.now(tz="UTC")
+                        bars_elapsed = int((now_time - entry_time).total_seconds() / 60)
+                    except Exception:
+                        bars_elapsed = pos.get("bars_held", 0)
+                else:
+                    bars_elapsed = pos.get("bars_held", 0)
+                pos["bars_held"] = bars_elapsed
+
                 should_trail = False
                 if pos["side"] == "long":
                     r_dist = entry - sl_orig
@@ -910,7 +926,7 @@ class WSTrader:
                     new_sl = entry + r_dist * 0.1
                     if current_high >= target_09r:
                         should_trail = True
-                    elif pos.get("bars_held", 0) >= 60 and current_close > entry:
+                    elif bars_elapsed >= 60 and current_close > entry:
                         should_trail = True
                 else:
                     r_dist = sl_orig - entry
@@ -920,7 +936,7 @@ class WSTrader:
                     new_sl = entry - r_dist * 0.1
                     if current_low <= target_09r:
                         should_trail = True
-                    elif pos.get("bars_held", 0) >= 60 and current_close < entry:
+                    elif bars_elapsed >= 60 and current_close < entry:
                         should_trail = True
 
                 if should_trail:
@@ -930,28 +946,26 @@ class WSTrader:
                         # Validate SL is on correct side of current price
                         valid_sl = True
                         if pos["side"] == "long" and new_sl >= current_close:
-                            valid_sl = False  # SL above price for long = immediate trigger
+                            valid_sl = False
                         elif pos["side"] == "short" and new_sl <= current_close:
-                            valid_sl = False  # SL below price for short = immediate trigger
+                            valid_sl = False
 
                         if valid_sl:
-                            logger.info("  TRAIL SL %s %s %s: SL -> %.6g (entry=%.6g, 0.9R=%.6g)",
+                            logger.info("  TRAIL SL %s %s %s: SL -> %.6g (entry=%.6g, 0.9R=%.6g, bars=%d)",
                                         pos["strategy"], pos["side"], sym,
-                                        new_sl, entry, target_09r)
+                                        new_sl, entry, target_09r, bars_elapsed)
                             self.client.modify_tp_sl(
                                 sym, pos_id,
                                 sl_price=str(round(new_sl, 8)),
                                 qty=str(pos_qty))
                         else:
-                            logger.info("  TRAIL SL skip %s: price=%.6g already past new_sl=%.6g (winning big)",
-                                        sym, current_close, new_sl)
+                            logger.info("  TRAIL SL skip %s: price=%.6g past new_sl=%.6g (bars=%d)",
+                                        sym, current_close, new_sl, bars_elapsed)
                     if "sl_original" not in pos:
                         pos["sl_original"] = pos["sl"]
                     pos["sl"] = round(new_sl, 8)
                     pos["sl_trailed"] = True
                     self.pos_tracker._save_local()
-
-                pos["bars_held"] = pos.get("bars_held", 0) + 1
 
 
 # ---------------------------------------------------------------------------
