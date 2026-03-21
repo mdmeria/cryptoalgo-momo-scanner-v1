@@ -609,20 +609,36 @@ class DailyPnLTracker:
 # Trade Logger
 # ---------------------------------------------------------------------------
 
+_TRADE_COLUMNS = [
+    "action", "timestamp", "symbol", "strategy", "side",
+    "entry", "actual_fill", "tp", "sl", "sl_pct", "tp_pct", "rr",
+    "qty", "risk_pct", "mode", "market_score",
+    "dps_total", "dps_confidence",
+    "sl_wall_usd", "sl_wall_strength", "tp_wall_usd", "tp_wall_strength",
+    "imbalance_1pct", "imbalance_2pct",
+    "zct_alignment", "order_id", "exchange_position_id",
+    "slippage_pct", "fill_time_sec", "wait_time_sec",
+    "outcome", "close_price", "pnl_pct", "realized_pnl", "fee",
+]
+
+
 def log_trade(trade: dict, action: str):
-    """Log trade entry/exit to CSV and console."""
+    """Log trade to CSV with fixed columns."""
     TRADER_DIR.mkdir(parents=True, exist_ok=True)
     write_header = not TRADES_LOG.exists()
     with open(TRADES_LOG, "a", encoding="utf-8") as f:
         if write_header:
-            cols = ["action"] + list(trade.keys())
-            f.write(",".join(cols) + "\n")
-        vals = [action]
-        for v in trade.values():
-            s = str(v) if v is not None else ""
-            if "," in s:
-                s = f'"{s}"'
-            vals.append(s)
+            f.write(",".join(_TRADE_COLUMNS) + "\n")
+        vals = []
+        for col in _TRADE_COLUMNS:
+            if col == "action":
+                vals.append(action)
+            else:
+                v = trade.get(col, "")
+                s = str(v) if v is not None else ""
+                if "," in s:
+                    s = f'"{s}"'
+                vals.append(s)
         f.write(",".join(vals) + "\n")
 
 
