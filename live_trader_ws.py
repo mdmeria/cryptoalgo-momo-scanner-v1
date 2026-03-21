@@ -329,12 +329,17 @@ class WSTrader:
         # Symbols with pending limit orders
         pending_syms = {info["symbol"] for info in self._pending_limit_orders.values()}
 
+        # Symbols already in watchlist don't need depth fetch
+        watchlist_syms = set(self._depth_watchlist.keys())
+
         eligible = []
         for sym in symbols:
             if sym in self.pos_tracker.get_all_symbols():
                 continue
             if sym in pending_syms:
                 continue
+            if sym in watchlist_syms:
+                continue  # already watching, no depth needed
             if len(live_positions) >= trading_cfg["max_positions"]:
                 break
             if sym not in self.candle_cache:
