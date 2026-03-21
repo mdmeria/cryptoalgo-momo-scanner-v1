@@ -244,6 +244,12 @@ class WSTrader:
         now = time.time()
         to_remove = []
 
+        # Log pending status
+        for oid, inf in self._pending_limit_orders.items():
+            wait = now - inf["placed_at"]
+            logger.info("    LIMIT PENDING: %s %s waiting %.0fs (price=%s)",
+                        inf["symbol"], inf["side"], wait, inf["entry_price"])
+
         for order_id, info in self._pending_limit_orders.items():
             symbol = info["symbol"]
             elapsed = now - info["placed_at"]
@@ -253,18 +259,11 @@ class WSTrader:
             has_position = len(positions) > 0
 
             if has_position:
-                # Order filled! Attach TP/SL to the position
+                # Order filled! TP/SL already attached to order
                 pos = positions[0]
                 pos_id = pos.get("positionId")
                 fill_price = float(pos.get("avgOpenPrice") or 0)
                 filled_qty = float(pos.get("qty") or 0)
-
-                # Attach TP/SL
-                tp_sl_result = self.client.modify_tp_sl(
-                    symbol, pos_id,
-                    tp_price=info["tp_price"],
-                    sl_price=info["sl_price"],
-                    qty=str(filled_qty))
 
                 setup = info["setup"]
                 setup["order_id"] = order_id
@@ -277,27 +276,41 @@ class WSTrader:
                 setup["mode"] = "live"
                 setup["slippage_pct"] = 0.0  # limit order = zero slippage
 
+                setup["fill_time_sec"] = round(elapsed, 1)
                 self.pos_tracker.add_position(setup)
                 log_trade(setup, "ENTRY_LIVE_LIMIT")
 
-                tp_ok = "OK" if tp_sl_result.get("code") == 0 else "FAILED"
-                logger.info("    LIMIT FILLED: %s fill=%.6g posId=%s TP/SL=%s",
-                            symbol, fill_price, pos_id, tp_ok)
+                logger.info("    LIMIT FILLED: %s fill=%.6g posId=%s filled_in=%.0fs (TP/SL on order)",
+                            symbol, fill_price, pos_id, elapsed)
 
                 to_remove.append(order_id)
 
             elif elapsed >= 180:  # 3 minutes
                 # Cancel the order
                 cancel_result = self.client._post(
-                    "/api/v1/futures/trade/cancel_order",
-                    {"symbol": symbol, "orderId": order_id})
+                    "/api/v1/futures/trade/cancel_orders",
+                    {"symbol": symbol, "orderList": [{"orderId": order_id}]})
                 cancel_code = cancel_result.get("code", -1)
                 if cancel_code == 0:
-                    logger.info("    LIMIT CANCELLED (3min): %s id=%s", symbol, order_id)
+                    logger.info("    LIMIT CANCELLED (%.0fs): %s id=%s — price didn't reach our level",
+                                elapsed, symbol, order_id)
                 else:
-                    # Cancel failed — might have just filled
                     logger.info("    LIMIT CANCEL response: %s %s (may have filled)",
                                 symbol, cancel_result.get("msg"))
+
+                # Log as missed trade
+                setup = info["setup"]
+                setup["order_id"] = order_id
+                setup["risk_pct"] = info["risk_pct"]
+                setup["market_score"] = self.market_cond.score
+                setup["mode"] = "live"
+                setup["wait_time_sec"] = round(elapsed, 1)
+                log_trade(setup, "MISSED_LIMIT")
+                logger.info("    MISSED: %s %s entry=%s tp=%s sl=%s RR=%.2f waited=%.0fs",
+                            symbol, info["side"], info["entry_price"],
+                            info["tp_price"], info["sl_price"],
+                            setup.get("rr", 0), elapsed)
+
                 to_remove.append(order_id)
 
         for oid in to_remove:
@@ -355,7 +368,8 @@ class WSTrader:
             self._check_setup_with_depth(sym, depth_data)
 
     def _check_setup_with_depth(self, symbol: str, depth_data: dict):
-        """Run strategy on a symbol with pre-fetched depth."""
+        """Run strategy on a symbol with pre-fetched depth.
+        Uses closed bars only (excludes current incomplete candle)."""
         if symbol not in self.candle_cache:
             return
 
@@ -366,7 +380,9 @@ class WSTrader:
                 return
 
             trading_cfg = self.config["trading"]
-            df = self.candle_cache[symbol]
+            # Exclude last bar (current incomplete candle) — strategy needs closed bars
+            full_df = self.candle_cache[symbol]
+            df = full_df.iloc[:-1].reset_index(drop=True) if len(full_df) > 1 else full_df
 
             if len(df) < 500:
                 return
@@ -451,10 +467,12 @@ class WSTrader:
 
                     if strat in ("depth", "depth_bounce"):
                         # LIMIT order for depth — zero slippage, 3 min expiry
+                        # TP/SL attached to order — activates only after fill
                         limit_price = str(round(entry_price, 8))
                         result = self.client.place_order(
                             symbol=symbol, side=order_side, qty=qty,
-                            order_type="LIMIT", price=limit_price)
+                            order_type="LIMIT", price=limit_price,
+                            tp_price=tp_price, sl_price=sl_price)
 
                         if result.get("code") == 0:
                             order_id = result["data"]["orderId"]
@@ -468,8 +486,9 @@ class WSTrader:
                                 "placed_at": time.time(),
                                 "strat": strat,
                             }
-                            logger.info("    LIMIT placed: %s id=%s price=%s (3min expiry)",
-                                        symbol, order_id, limit_price)
+                            logger.info("    LIMIT placed: %s %s id=%s price=%s tp=%s sl=%s RR=%.2f (3min expiry)",
+                                        symbol, order_side, order_id, limit_price,
+                                        tp_price, sl_price, setup["rr"])
                         else:
                             logger.error("    LIMIT FAILED: %s — %s",
                                          symbol, result.get("msg"))
@@ -641,16 +660,21 @@ class WSTrader:
     # --- WebSocket Handlers (called from WS threads) ---
 
     def _handle_kline(self, symbol: str, candle: dict):
-        """Hot path — called on every kline update."""
+        """Called on every kline update — only process on NEW candle (previous bar closed)."""
         ts = candle.get("timestamp", 0)
 
-        # Deduplicate
+        # Only process when we see a NEW candle timestamp
+        # This means the PREVIOUS candle just closed
         last_ts = self._last_candle_ts.get(symbol, 0)
         if ts <= last_ts:
+            # Same candle updating — skip (mid-candle tick)
             return
-        self._last_candle_ts[symbol] = ts
 
-        # Append to candle cache
+        # New candle started — the previous candle is now CLOSED
+        self._last_candle_ts[symbol] = ts
+        logger.debug("New candle: %s ts=%d", symbol, ts)
+
+        # Append the new candle to cache
         if symbol in self.candle_cache:
             new_row = {
                 "timestamp": pd.Timestamp(ts, unit="ms", tz="UTC"),
@@ -668,7 +692,7 @@ class WSTrader:
                 df = df.tail(MR_WARMUP_BARS + 50).reset_index(drop=True)
             self.candle_cache[symbol] = df
 
-            # Queue for batch processing (all candles close at same time)
+            # Queue for batch processing — only on candle close
             with self._batch_lock:
                 self._pending_candle_symbols.add(symbol)
 
@@ -903,13 +927,24 @@ class WSTrader:
                     pos_id = pos.get("exchange_position_id")
                     pos_qty = pos.get("qty") or pos.get("exchange_qty")
                     if pos_id and pos_qty and pos.get("mode") == "live":
-                        logger.info("  TRAIL SL %s %s %s: SL -> %.6g (entry=%.6g, 0.9R=%.6g)",
-                                    pos["strategy"], pos["side"], sym,
-                                    new_sl, entry, target_09r)
-                        self.client.modify_tp_sl(
-                            sym, pos_id,
-                            sl_price=str(round(new_sl, 8)),
-                            qty=str(pos_qty))
+                        # Validate SL is on correct side of current price
+                        valid_sl = True
+                        if pos["side"] == "long" and new_sl >= current_close:
+                            valid_sl = False  # SL above price for long = immediate trigger
+                        elif pos["side"] == "short" and new_sl <= current_close:
+                            valid_sl = False  # SL below price for short = immediate trigger
+
+                        if valid_sl:
+                            logger.info("  TRAIL SL %s %s %s: SL -> %.6g (entry=%.6g, 0.9R=%.6g)",
+                                        pos["strategy"], pos["side"], sym,
+                                        new_sl, entry, target_09r)
+                            self.client.modify_tp_sl(
+                                sym, pos_id,
+                                sl_price=str(round(new_sl, 8)),
+                                qty=str(pos_qty))
+                        else:
+                            logger.info("  TRAIL SL skip %s: price=%.6g already past new_sl=%.6g (winning big)",
+                                        sym, current_close, new_sl)
                     if "sl_original" not in pos:
                         pos["sl_original"] = pos["sl"]
                     pos["sl"] = round(new_sl, 8)

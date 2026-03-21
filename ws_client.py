@@ -109,6 +109,10 @@ class BitunixWS:
         self._depth_cache: dict[str, dict] = {}
         self._candle_buffer: dict[str, list] = {}
 
+        # Connection tracking
+        self._last_disconnect_ts: float = 0
+        self._total_disconnects: int = 0
+
         # Event loop reference
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -127,7 +131,12 @@ class BitunixWS:
                 ) as ws:
                     self._public_ws = ws
                     self._public_connected = True
-                    logger.info("Public WS connected")
+                    if self._last_disconnect_ts > 0:
+                        downtime = time.time() - self._last_disconnect_ts
+                        logger.info("Public WS RECONNECTED (downtime=%.1fs, total_disconnects=%d)",
+                                    downtime, self._total_disconnects)
+                    else:
+                        logger.info("Public WS connected")
 
                     # Re-subscribe
                     await self._resubscribe_public()
@@ -140,7 +149,9 @@ class BitunixWS:
                         async for message in ws:
                             await self._handle_public_message(message)
                     except websockets.exceptions.ConnectionClosedError:
-                        logger.warning("Public WS closed by server")
+                        self._last_disconnect_ts = time.time()
+                        self._total_disconnects += 1
+                        logger.warning("Public WS DISCONNECTED (total=%d)", self._total_disconnects)
                     except Exception as e:
                         logger.error("Public WS error: %s", e)
                     finally:
