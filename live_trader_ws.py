@@ -144,6 +144,9 @@ class WSTrader:
         # Pending limit orders: {orderId: {symbol, side, tp, sl, qty, setup, placed_at}}
         self._pending_limit_orders: dict[str, dict] = {}
 
+        # Depth watchlist: {symbol: {setup details, created_at}}
+        self._depth_watchlist: dict[str, dict] = {}
+
         # Pending WS subscriptions (sync -> async bridge)
         self._pending_subscriptions: set[str] = set()
 
@@ -367,6 +370,9 @@ class WSTrader:
             depth_data = depth_results.get(sym)
             self._check_setup_with_depth(sym, depth_data)
 
+        # Also check watchlist for wall touches on this candle batch
+        self._check_watchlist(symbols)
+
     def _check_setup_with_depth(self, symbol: str, depth_data: dict):
         """Run strategy on a symbol with pre-fetched depth.
         Uses closed bars only (excludes current incomplete candle)."""
@@ -403,17 +409,42 @@ class WSTrader:
                 logger.debug("Strategy error %s: %s", symbol, e)
                 return
 
+            # --- Depth: add to watchlist instead of entering ---
+            if depth_data and symbol not in self._depth_watchlist:
+                from strategy_depth import find_depth_watchlist_setup, DepthWatchlistSettings
+                wl_cfg = DepthWatchlistSettings()
+                wl_result = find_depth_watchlist_setup(depth_data, float(df.iloc[-1]["close"]), wl_cfg)
+                if wl_result["passed"]:
+                    strat_mode = self.strat_modes.get("depth", "off")
+                    if strat_mode != "off":
+                        side = wl_result["side"]
+                        if self.market_cond.is_allowed("depth", side):
+                            cd_key = f"{symbol}_depth"
+                            if time.time() - self.depth_cooldown.get(cd_key, 0) >= 1800:
+                                self._depth_watchlist[symbol] = {
+                                    **wl_result,
+                                    "created_at": time.time(),
+                                    "strat_mode": strat_mode,
+                                }
+                                logger.info("  WATCHLIST ADD %s %s: wall=%.6g dist=%.2f%% tp=%.6g sl=%.6g RR=%.2f (wait %dmin)",
+                                            side.upper(), symbol,
+                                            wl_result["entry_wall_price"],
+                                            wl_result["distance_pct"],
+                                            wl_result["tp"], wl_result["sl"],
+                                            wl_result["rr"],
+                                            wl_cfg.max_watch_minutes)
+
+            # --- MR / Momo: direct entry (unchanged) ---
             for setup in found_setups:
                 strat = setup["strategy"]
+
+                # Skip depth — handled by watchlist above
+                if strat in ("depth", "depth_bounce"):
+                    continue
 
                 strat_mode = self.strat_modes.get(strat, "off")
                 if strat_mode == "off":
                     continue
-
-                if strat in ("depth", "depth_bounce"):
-                    cd_key = f"{symbol}_{strat}"
-                    if time.time() - self.depth_cooldown.get(cd_key, 0) < 1800:
-                        continue
 
                 side = setup["side"]
                 if strat == "momentum" and setup.get("dps_total", 0) < 4:
@@ -466,32 +497,8 @@ class WSTrader:
                         self._margin_configured.add(symbol)
 
                     if strat in ("depth", "depth_bounce"):
-                        # LIMIT order for depth — zero slippage, 3 min expiry
-                        # TP/SL attached to order — activates only after fill
-                        limit_price = str(round(entry_price, 8))
-                        result = self.client.place_order(
-                            symbol=symbol, side=order_side, qty=qty,
-                            order_type="LIMIT", price=limit_price,
-                            tp_price=tp_price, sl_price=sl_price)
-
-                        if result.get("code") == 0:
-                            order_id = result["data"]["orderId"]
-                            self._pending_limit_orders[order_id] = {
-                                "symbol": symbol, "side": side,
-                                "order_side": order_side,
-                                "entry_price": entry_price,
-                                "tp_price": tp_price, "sl_price": sl_price,
-                                "qty": qty, "setup": setup,
-                                "risk_pct": risk_pct,
-                                "placed_at": time.time(),
-                                "strat": strat,
-                            }
-                            logger.info("    LIMIT placed: %s %s id=%s price=%s tp=%s sl=%s RR=%.2f (3min expiry)",
-                                        symbol, order_side, order_id, limit_price,
-                                        tp_price, sl_price, setup["rr"])
-                        else:
-                            logger.error("    LIMIT FAILED: %s — %s",
-                                         symbol, result.get("msg"))
+                        # Depth handled by watchlist — should not reach here
+                        continue
 
                     else:
                         # MARKET order for Momo — immediate fill with TP/SL
@@ -527,6 +534,215 @@ class WSTrader:
                         json.dump(self.depth_cooldown, f)
 
                 break
+
+    def _check_watchlist(self, candle_symbols: list[str]):
+        """Check watchlist for wall touches, expirations, and invalidations."""
+        from strategy_depth import check_wall_touch
+        from live_data_collector import fetch_bitunix_depth
+
+        if not self._depth_watchlist:
+            return
+
+        now = time.time()
+        to_remove = []
+        trading_cfg = self.config["trading"]
+
+        for symbol, wl in self._depth_watchlist.items():
+            elapsed_min = (now - wl["created_at"]) / 60
+
+            # Log watchlist status
+            logger.info("  WATCH %s %s: wall=%.6g dist=%.2f%% waiting=%.0fmin",
+                        wl["side"].upper(), symbol,
+                        wl["entry_wall_price"], wl["distance_pct"], elapsed_min)
+
+            # Expired?
+            max_watch = wl.get("max_watch_minutes", 30)
+            if elapsed_min >= max_watch:
+                logger.info("  WATCH EXPIRED: %s (%.0fmin) — wall=%.6g never reached",
+                            symbol, elapsed_min, wl["entry_wall_price"])
+                log_trade({"symbol": symbol, "strategy": "depth", "side": wl["side"],
+                           "entry": wl["entry_price"], "tp": wl["tp"], "sl": wl["sl"],
+                           "rr": wl["rr"], "entry_wall_price": wl["entry_wall_price"],
+                           "wait_time_sec": round(elapsed_min * 60)},
+                          "WATCHLIST_EXPIRED")
+                to_remove.append(symbol)
+                continue
+
+            # Has candle data updated for this symbol?
+            if symbol not in candle_symbols:
+                continue
+            if symbol not in self.candle_cache:
+                continue
+
+            full_df = self.candle_cache[symbol]
+            if len(full_df) < 2:
+                continue
+
+            # Use last CLOSED bar
+            last_bar = full_df.iloc[-2]
+            candle = {
+                "high": float(last_bar["high"]),
+                "low": float(last_bar["low"]),
+                "close": float(last_bar["close"]),
+            }
+
+            # Check wall touch
+            status = check_wall_touch(candle, wl["entry_wall_price"],
+                                       wl["side"], wl["invalidation_price"])
+
+            if status == "broken":
+                logger.info("  WATCH BROKEN: %s — candle closed beyond wall %.6g (close=%.6g)",
+                            symbol, wl["entry_wall_price"], candle["close"])
+                log_trade({"symbol": symbol, "strategy": "depth", "side": wl["side"],
+                           "entry": wl["entry_price"], "tp": wl["tp"], "sl": wl["sl"],
+                           "rr": wl["rr"], "entry_wall_price": wl["entry_wall_price"],
+                           "close_price": candle["close"],
+                           "wait_time_sec": round(elapsed_min * 60)},
+                          "WATCHLIST_BROKEN")
+                to_remove.append(symbol)
+
+            elif status == "confirmed":
+                # Wall touched and held! Re-check wall strength before entering
+                logger.info("  WATCH CONFIRMED: %s — wick touched wall %.6g, close=%.6g (wall held!)",
+                            symbol, wl["entry_wall_price"], candle["close"])
+
+                # Re-fetch depth to verify wall still exists
+                fresh_depth = fetch_bitunix_depth(symbol, limit="max")
+                wall_still_valid = True
+                if fresh_depth:
+                    from live_data_collector import analyze_depth
+                    analysis = analyze_depth(fresh_depth, candle["close"])
+                    # Check if wall is still there
+                    if wl["side"] == "long":
+                        walls = analysis.get("tp_sl_walls_support", [])
+                    else:
+                        walls = analysis.get("tp_sl_walls_resistance", [])
+                    # Find our entry wall
+                    found = False
+                    for w in walls:
+                        if abs(w["price"] - wl["entry_wall_price"]) / wl["entry_wall_price"] < 0.005:
+                            found = True
+                            logger.info("    Wall verified: $%.0f (%.1fx) — still there",
+                                        w["price"] * w["qty"], w.get("strength", 0))
+                            break
+                    if not found:
+                        wall_still_valid = False
+                        logger.info("    Wall GONE at %.6g — skipping entry", wl["entry_wall_price"])
+
+                if not wall_still_valid:
+                    log_trade({"symbol": symbol, "strategy": "depth", "side": wl["side"],
+                               "entry": wl["entry_price"], "tp": wl["tp"], "sl": wl["sl"],
+                               "rr": wl["rr"], "entry_wall_price": wl["entry_wall_price"]},
+                              "WATCHLIST_WALL_GONE")
+                    to_remove.append(symbol)
+                    continue
+
+                # Wall confirmed + still exists → PLACE ORDER
+                with self._lock:
+                    live_count = sum(1 for p in self.pos_tracker.local_positions if p.get("mode") != "dummy")
+                    if live_count >= trading_cfg["max_positions"]:
+                        logger.info("    Max positions reached — skipping %s", symbol)
+                        to_remove.append(symbol)
+                        continue
+
+                    if symbol in self.pos_tracker.get_all_symbols():
+                        to_remove.append(symbol)
+                        continue
+
+                    # Calculate qty
+                    balance_data = self.client.get_balance(trading_cfg["margin_coin"])
+                    available = float(balance_data.get("available", 0))
+                    if available <= 0:
+                        continue
+
+                    risk_pct = get_risk_pct({"strategy": "depth"}, _strategy_cfg)
+                    entry_price = wl["entry_price"]
+                    sl_pct = wl["sl_pct"]
+
+                    qty = calculate_qty(symbol, entry_price, risk_pct, sl_pct,
+                                        available, trading_cfg["leverage"], self.pairs_info)
+                    if float(qty) <= 0:
+                        continue
+
+                    order_side = "BUY" if wl["side"] == "long" else "SELL"
+                    tp_price = str(round(wl["tp"], 8))
+                    sl_price = str(round(wl["sl"], 8))
+                    limit_price = str(round(entry_price, 8))
+
+                    strat_mode = wl.get("strat_mode", "live")
+
+                    if strat_mode == "dummy":
+                        setup = {"symbol": symbol, "strategy": "depth_wall",
+                                 "side": wl["side"], "entry": entry_price,
+                                 "tp": wl["tp"], "sl": wl["sl"],
+                                 "sl_pct": sl_pct, "tp_pct": wl["tp_pct"], "rr": wl["rr"],
+                                 "entry_wall_price": wl["entry_wall_price"],
+                                 "entry_wall_usd": wl["entry_wall_usd"],
+                                 "entry_wall_strength": wl["entry_wall_strength"],
+                                 "imbalance_1pct": wl["imbalance_1pct"],
+                                 "order_id": f"dummy_{int(time.time())}",
+                                 "qty": qty, "risk_pct": risk_pct,
+                                 "market_score": self.market_cond.score,
+                                 "bars_held": 0, "mode": "dummy",
+                                 "timestamp": str(pd.Timestamp.now(tz="UTC")),
+                                 "wait_time_sec": round(elapsed_min * 60)}
+                        self.pos_tracker.add_position(setup)
+                        log_trade(setup, "ENTRY_WALL_DUMMY")
+                        logger.info("    WALL ENTRY (dummy): %s %s at %.6g RR=%.2f",
+                                    wl["side"], symbol, entry_price, wl["rr"])
+
+                    elif strat_mode == "live":
+                        # Ensure margin
+                        if symbol not in self._margin_configured:
+                            self.client.ensure_margin_and_leverage(
+                                symbol, trading_cfg["leverage"], trading_cfg["margin_mode"])
+                            self._margin_configured.add(symbol)
+
+                        # Place limit at wall price with TP/SL
+                        result = self.client.place_order(
+                            symbol=symbol, side=order_side, qty=qty,
+                            order_type="LIMIT", price=limit_price,
+                            tp_price=tp_price, sl_price=sl_price)
+
+                        if result.get("code") == 0:
+                            order_id = result["data"]["orderId"]
+                            self._pending_limit_orders[order_id] = {
+                                "symbol": symbol, "side": wl["side"],
+                                "order_side": order_side,
+                                "entry_price": entry_price,
+                                "tp_price": tp_price, "sl_price": sl_price,
+                                "qty": qty,
+                                "setup": {"symbol": symbol, "strategy": "depth_wall",
+                                          "side": wl["side"], "entry": entry_price,
+                                          "tp": wl["tp"], "sl": wl["sl"],
+                                          "sl_pct": sl_pct, "tp_pct": wl["tp_pct"],
+                                          "rr": wl["rr"],
+                                          "entry_wall_price": wl["entry_wall_price"],
+                                          "entry_wall_usd": wl["entry_wall_usd"],
+                                          "entry_wall_strength": wl["entry_wall_strength"],
+                                          "imbalance_1pct": wl["imbalance_1pct"],
+                                          "timestamp": str(pd.Timestamp.now(tz="UTC")),
+                                          "dps_total": 0, "dps_confidence": "wall_confirmed"},
+                                "risk_pct": risk_pct,
+                                "placed_at": time.time(),
+                                "strat": "depth_wall",
+                            }
+                            logger.info("    WALL ENTRY: %s %s LIMIT id=%s price=%s tp=%s sl=%s RR=%.2f (3min expiry)",
+                                        wl["side"].upper(), symbol, order_id,
+                                        limit_price, tp_price, sl_price, wl["rr"])
+                        else:
+                            logger.error("    WALL ENTRY FAILED: %s — %s",
+                                         symbol, result.get("msg"))
+
+                    # Set cooldown
+                    self.depth_cooldown[f"{symbol}_depth"] = time.time()
+                    with open(TRADER_DIR / "depth_cooldown.json", "w") as f:
+                        json.dump(self.depth_cooldown, f)
+
+                    to_remove.append(symbol)
+
+        for sym in to_remove:
+            self._depth_watchlist.pop(sym, None)
 
     # --- Periodic Tasks (background, not time-critical) ---
 

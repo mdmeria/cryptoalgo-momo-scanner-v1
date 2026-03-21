@@ -614,6 +614,7 @@ _TRADE_COLUMNS = [
     "entry", "actual_fill", "tp", "sl", "sl_pct", "tp_pct", "rr",
     "qty", "risk_pct", "mode", "market_score",
     "dps_total", "dps_confidence",
+    "entry_wall_price", "entry_wall_usd", "entry_wall_strength",
     "sl_wall_usd", "sl_wall_strength", "tp_wall_usd", "tp_wall_strength",
     "imbalance_1pct", "imbalance_2pct",
     "zct_alignment", "order_id", "exchange_position_id",
