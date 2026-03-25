@@ -178,8 +178,9 @@ class DepthWatchlistSettings:
     min_rr: float = 1.5               # Min RR (should be higher since better entry)
     sl_buffer_pct: float = 1.0        # SL placed this % beyond entry wall (min 1%)
     tp_buffer_pct: float = 0.1        # TP placed this % before TP wall
-    max_watch_minutes: int = 30       # Max time to wait for price to reach wall
-    max_distance_pct: float = 2.0     # Max distance from current price to entry wall
+    max_watch_minutes: int = 10       # Max time to wait for price to reach wall
+    max_distance_pct: float = 0.5     # Max distance from current price to entry wall
+    max_closes_beyond: int = 2        # Allow up to N candle closes beyond wall before broken
 
 
 def find_depth_watchlist_setup(depth_data: dict, current_price: float,
@@ -340,13 +341,23 @@ def _find_tp_wall_for_watchlist(clusters: list[dict], current_price: float,
 
 
 def check_wall_touch(candle: dict, entry_wall_price: float, side: str,
-                      invalidation_price: float) -> str:
+                      invalidation_price: float,
+                      closes_beyond: int = 0, max_closes_beyond: int = 2) -> str:
     """
     Check if a candle confirms wall touch.
 
+    Allows up to max_closes_beyond candle closes on the wrong side of the wall.
+    If the next candle after those closes back on the correct side → confirmed.
+    If closes_beyond reaches max_closes_beyond + 1 (3rd close beyond) → broken.
+
+    Args:
+        closes_beyond: how many candles have already closed beyond the wall
+        max_closes_beyond: max allowed closes beyond before broken (default 2)
+
     Returns:
-        'confirmed' — wick touched wall, close stayed on correct side
-        'broken' — candle closed beyond wall (invalidated)
+        'confirmed' — candle closed on correct side after touching wall
+        'broken' — too many closes beyond wall (invalidated)
+        'touched' — closed beyond wall but still within tolerance
         'waiting' — price hasn't reached wall yet
     """
     high = candle["high"]
@@ -355,20 +366,26 @@ def check_wall_touch(candle: dict, entry_wall_price: float, side: str,
 
     if side == "long":
         # Want price to dip DOWN to support wall, then close at or above it
-        if low <= entry_wall_price:
+        if low <= entry_wall_price or closes_beyond > 0:
             if close >= entry_wall_price:
-                return "confirmed"  # wick touched, close at/above = wall held
+                return "confirmed"  # close at/above wall = wall held
             else:
-                return "broken"  # closed below wall = broken
+                # Close below wall — check tolerance
+                if closes_beyond + 1 > max_closes_beyond:
+                    return "broken"  # 3rd close below = broken
+                return "touched"  # still within tolerance
         return "waiting"
 
     else:  # short
         # Want price to rise UP to resistance wall, then close at or below it
-        if high >= entry_wall_price:
+        if high >= entry_wall_price or closes_beyond > 0:
             if close <= entry_wall_price:
-                return "confirmed"  # wick touched, close at/below = wall held
+                return "confirmed"  # close at/below wall = wall held
             else:
-                return "broken"  # closed above wall = broken
+                # Close above wall — check tolerance
+                if closes_beyond + 1 > max_closes_beyond:
+                    return "broken"  # 3rd close above = broken
+                return "touched"  # still within tolerance
         return "waiting"
 
 

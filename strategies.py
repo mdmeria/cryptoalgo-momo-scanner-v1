@@ -41,6 +41,8 @@ class StrategyConfig:
     enable_momentum: bool = True
     enable_depth: bool = True
     enable_depth_bounce: bool = True
+    enable_bouncy_ball: bool = True
+    enable_mr_chop: bool = True
 
     # Global filters
     min_dps_live: int = 3           # min DPS score to take a trade in live
@@ -54,6 +56,7 @@ class StrategyConfig:
     max_positions_momo: int = 10
     max_positions_depth: int = 10
     max_positions_depth_bounce: int = 10
+    max_positions_bouncy_ball: int = 10
 
     @classmethod
     def from_json(cls, path: str = STRATEGY_CONFIG_FILE) -> "StrategyConfig":
@@ -128,6 +131,21 @@ from strategy_depth_bounce import (
     check_75pct_tp_rule,
 )
 
+# ---------------------------------------------------------------------------
+# Bouncy Ball MR — oscillating range strategy
+# ---------------------------------------------------------------------------
+
+from strategy_bouncy_ball import (
+    BouncyBallSettings,
+    check_bouncy_ball_setup,
+)
+
+from strategy_mr_chop import (
+    MRChopSettings,
+    check_range_shift_setup,
+    check_one_sided_chop_setup,
+)
+
 
 # ---------------------------------------------------------------------------
 # Strategy runner — detects setups for all enabled strategies
@@ -144,6 +162,10 @@ def detect_setups(df: pd.DataFrame, symbol: str,
     Returns a list of setup dicts (0, 1, or 2 — one per strategy).
     """
     setups = []
+
+    # Skip symbols used only for market condition evaluation (not traded)
+    if symbol in DEPTH_EXCLUDED_SYMBOLS:
+        return setups
 
     # --- Mean Reversion ---
     if config.enable_mean_reversion and mr_cfg is not None:
@@ -357,13 +379,88 @@ def detect_setups(df: pd.DataFrame, symbol: str,
                 }
                 setups.append(setup)
 
+    # --- Bouncy Ball MR ---
+    if config.enable_bouncy_ball:
+        min_bars_bb = 480 + 240 + 10  # range + pre-trend lookback
+        if len(df) >= min_bars_bb:
+            df_sorted = df.sort_values("timestamp").reset_index(drop=True)
+            i = len(df_sorted) - 1
+            bb_cfg = BouncyBallSettings()
+            result = check_bouncy_ball_setup(df_sorted, i, bb_cfg)
+            if result["passed"]:
+                setup = {
+                    "symbol": symbol,
+                    "strategy": "bouncy_ball",
+                    "timestamp": str(df_sorted.iloc[i]["timestamp"]),
+                    "side": result["side"],
+                    "entry": result["entry"],
+                    "sl": result["sl"],
+                    "tp": result["tp"],
+                    "sl_pct": result["sl_pct"],
+                    "tp_pct": result["tp_pct"],
+                    "rr": result["rr"],
+                    "range_upper": result["range_upper"],
+                    "range_lower": result["range_lower"],
+                    "range_pct": result["range_pct"],
+                    "upper_touches": result["upper_touches"],
+                    "lower_touches": result["lower_touches"],
+                    "clean_score": result["clean_score"],
+                    "inside_pct": result["inside_pct"],
+                    "pre_trend": result["pre_trend"],
+                    "pre_trend_pct": result["pre_trend_pct"],
+                    "range_duration_bars": result["range_duration_bars"],
+                    "dps_total": result["clean_score"],  # use clean score as quality
+                    "dps_confidence": "high" if result["clean_score"] >= 8 else "medium",
+                }
+                setups.append(setup)
+
+    # --- MR Chop (Range Shift + One-Sided Chop) ---
+    if config.enable_mr_chop:
+        min_bars_chop = 600 + 10
+        if len(df) >= min_bars_chop:
+            df_sorted = df.sort_values("timestamp").reset_index(drop=True)
+            i = len(df_sorted) - 1
+            chop_cfg = MRChopSettings()
+
+            # Try Range Shift first
+            result = check_range_shift_setup(df_sorted, i, chop_cfg)
+            if not result["passed"]:
+                # Try One-Sided Chop
+                result = check_one_sided_chop_setup(df_sorted, i, chop_cfg)
+
+            if result["passed"]:
+                variant = result.get("strategy_variant", "mr_chop")
+                setup = {
+                    "symbol": symbol,
+                    "strategy": "mr_chop",
+                    "strategy_variant": variant,
+                    "timestamp": str(df_sorted.iloc[i]["timestamp"]),
+                    "side": result["side"],
+                    "entry": result["entry"],
+                    "sl": result["sl"],
+                    "tp": result["tp"],
+                    "sl_pct": result["sl_pct"],
+                    "tp_pct": result["tp_pct"],
+                    "rr": result["rr"],
+                    "n_swings": result.get("n_swings", 0),
+                    "last_swing_mins": result.get("last_swing_mins", 0),
+                    "chop_hrs": result.get("chop_hrs", 0),
+                    "dps_total": result.get("dps_total", 0),
+                    "dps_confidence": "high" if result.get("dps_total", 0) >= 5 else "medium",
+                    "vol_type": result.get("vol_type", ""),
+                    "pre_trend": result.get("pre_trend", ""),
+                    "shift_pct": result.get("shift_pct", 0),
+                    "level_touches": result.get("level_touches", 0),
+                }
+                setups.append(setup)
+
     return setups
 
 
 def get_risk_pct(setup: dict, config: StrategyConfig) -> float:
     """Determine risk % for a setup based on DPS confidence and pre-chop trend."""
-    # Depth strategies: always dummy risk (experimental)
-    if setup.get("strategy") in ("depth", "depth_bounce"):
+    # Depth/bouncy_ball strategies: always dummy risk (experimental)
+    if setup.get("strategy") in ("depth", "depth_bounce", "bouncy_ball", "mr_chop"):
         return config.dummy_risk_pct
 
     # MR: force dummy on unclear pre-chop trend
@@ -505,7 +602,7 @@ class MarketCondition:
                 return False
             return True
 
-        elif strategy in ("depth", "depth_bounce"):
+        elif strategy in ("depth", "depth_bounce", "bouncy_ball", "mr_chop"):
             # At extremes: only allow direction-aligned trades
             # Score +3: only longs. Score -3: only shorts.
             if s >= 3 and side == "short":

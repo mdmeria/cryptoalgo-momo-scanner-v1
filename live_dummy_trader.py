@@ -500,16 +500,19 @@ def log_cycle(cycle_num: int, n_coins: int, n_mr_setups: int, n_momo_setups: int
 def trading_cycle(pos_mgr: PositionManager,
                   min_vol: float, top_n: int, cycle_num: int,
                   candle_cache: dict, depth_cooldown: dict = None,
-                  market_cond: MarketCondition = None) -> dict:
+                  market_cond: MarketCondition = None,
+                  pending_limits: dict = None) -> dict:
     """
     Run one trading cycle:
     1. Get active coins from Orion
     2. Fetch candles for each
     3. Check for MR and Momo setups
-    4. Enter dummy trades
+    4. Enter dummy trades (mr_chop uses limit orders)
     5. Check open positions for TP/SL hits
-    6. Log depth comparison
+    6. Manage pending limit orders (3 min expiry)
     """
+    if pending_limits is None:
+        pending_limits = {}
     stats = {"coins": 0, "mr_setups": 0, "momo_setups": 0, "closed": 0, "pnl": 0.0}
 
     # Step 1: Get active coins
@@ -646,7 +649,7 @@ def trading_cycle(pos_mgr: PositionManager,
                 continue
 
             # Depth/depth_bounce cooldown: skip if recently traded this symbol
-            if strat in ("depth", "depth_bounce") and depth_cooldown is not None:
+            if strat in ("depth", "depth_bounce", "bouncy_ball", "mr_chop") and depth_cooldown is not None:
                 cd_key = f"{sym}_{strat}"
                 last_cycle = depth_cooldown.get(cd_key, -999)
                 if cycle_num - last_cycle < 30:  # ~30 min cooldown
@@ -678,6 +681,27 @@ def trading_cycle(pos_mgr: PositionManager,
             setup["market_score"] = market_cond.score if market_cond else 0
             setup["bars_held"] = 0
 
+            # MR Chop: use limit order at level price
+            if strat == "mr_chop":
+                limit_key = f"{sym}_mr_chop"
+                if limit_key not in pending_limits:
+                    import time as _time
+                    pending_limits[limit_key] = {
+                        **setup,
+                        "placed_at": _time.time(),
+                        "limit_price": setup["entry"],
+                    }
+                    variant = setup.get("strategy_variant", "mr_chop_v2")
+                    logger.info("  LIMIT MR_CHOP(%s) %s %s: price=%.6g tp=%.6g(%.2f%%) "
+                                "sl=%.6g(%.2f%%) RR=%.2f DPS=%d src=%s sw=%d (3min expiry)",
+                                variant, setup["side"].upper(), sym,
+                                setup["entry"], setup["tp"], setup["tp_pct"],
+                                setup["sl"], setup["sl_pct"],
+                                setup["rr"], setup["dps_total"],
+                                setup.get("level_source", "?"),
+                                setup.get("n_swings", 0))
+                continue  # don't open position yet — wait for fill
+
             # Depth comparison (use already-fetched depth_data)
             depth_alt = None
             if depth_data and strat != "depth":
@@ -689,12 +713,14 @@ def trading_cycle(pos_mgr: PositionManager,
             log_trade_entry(setup, depth_alt)
 
             # Set depth/depth_bounce cooldown
-            if strat in ("depth", "depth_bounce") and depth_cooldown is not None:
+            if strat in ("depth", "depth_bounce", "bouncy_ball", "mr_chop") and depth_cooldown is not None:
                 depth_cooldown[f"{sym}_{strat}"] = cycle_num
 
             strat_labels = {"mean_reversion": "MR", "strict_mr": "STRICT_MR",
                            "momentum": "MOMO", "depth": "DEPTH",
-                           "depth_bounce": "DEPTH_BOUNCE"}
+                           "depth_bounce": "DEPTH_BOUNCE",
+                           "bouncy_ball": "BB_MR",
+                           "mr_chop": "MR_CHOP"}
             strat_label = strat_labels.get(strat, strat.upper())
             if strat in ("depth", "depth_bounce"):
                 zct_align = setup.get("zct_alignment", "unclear")
@@ -726,6 +752,36 @@ def trading_cycle(pos_mgr: PositionManager,
                                 setup.get("tp_wall_strength", 0),
                                 setup.get("imbalance_1pct", 0),
                                 zct_mr, zct_momo)
+            elif strat == "bouncy_ball":
+                logger.info("  NEW %s %s %s: entry=%.6g tp=%.6g(%.2f%%) sl=%.6g(%.2f%%) "
+                            "RR=%.2f clean=%d [%s]",
+                            strat_label, setup["side"].upper(), sym,
+                            setup["entry"], setup["tp"], setup["tp_pct"],
+                            setup["sl"], setup["sl_pct"],
+                            setup["rr"], setup.get("clean_score", 0),
+                            setup.get("dps_confidence", "?"))
+                logger.info("    range: %.6g-%.6g (%.2f%%) up_t=%d lo_t=%d "
+                            "inside=%.0f%% pre=%s(%.1f%%) dur=%dmin",
+                            setup.get("range_lower", 0), setup.get("range_upper", 0),
+                            setup.get("range_pct", 0),
+                            setup.get("upper_touches", 0), setup.get("lower_touches", 0),
+                            setup.get("inside_pct", 0),
+                            setup.get("pre_trend", "?"), setup.get("pre_trend_pct", 0),
+                            setup.get("range_duration_bars", 0))
+            elif strat == "mr_chop":
+                variant = setup.get("strategy_variant", "?")
+                logger.info("  NEW %s(%s) %s %s: entry=%.6g tp=%.6g(%.2f%%) sl=%.6g(%.2f%%) "
+                            "RR=%.2f DPS=%d [%s]",
+                            strat_label, variant, setup["side"].upper(), sym,
+                            setup["entry"], setup["tp"], setup["tp_pct"],
+                            setup["sl"], setup["sl_pct"],
+                            setup["rr"], setup.get("dps_total", 0),
+                            setup.get("dps_confidence", "?"))
+                logger.info("    swings=%d last=%dm vol=%s chop=%.1fh pre=%s shift=%.2f%% touches=%d",
+                            setup.get("n_swings", 0), setup.get("last_swing_mins", 0),
+                            setup.get("vol_type", "?"), setup.get("chop_hrs", 0),
+                            setup.get("pre_trend", "?"), setup.get("shift_pct", 0),
+                            setup.get("level_touches", 0))
             else:
                 tp_src = setup.get("tp_source", "strategy")
                 tp_tag = f" tp_src={tp_src}" if tp_src != "strategy" else ""
@@ -744,6 +800,45 @@ def trading_cycle(pos_mgr: PositionManager,
                             f"{depth_alt['depth_sl_wall_usd']:,.0f}")
 
         time.sleep(0.12)  # Rate limit between symbols
+
+    # --- Manage pending MR_CHOP limit orders ---
+    import time as _time
+    expired_keys = []
+    for limit_key, lim in list(pending_limits.items()):
+        sym_lim = lim["symbol"]
+        elapsed = _time.time() - lim["placed_at"]
+        limit_price = lim["limit_price"]
+        side_lim = lim["side"]
+
+        # Check if filled: did price reach limit level?
+        if sym_lim in candle_cache:
+            df_lim = candle_cache[sym_lim]
+            if len(df_lim) > 0:
+                last_bar = df_lim.iloc[-1]
+                if side_lim == "short" and float(last_bar["high"]) >= limit_price:
+                    # Filled! Open position
+                    pos_mgr.open_position(lim)
+                    log_trade_entry(lim)
+                    logger.info("  LIMIT FILLED MR_CHOP %s %s: fill=%.6g waited=%.0fs",
+                                side_lim.upper(), sym_lim, limit_price, elapsed)
+                    expired_keys.append(limit_key)
+                    continue
+                elif side_lim == "long" and float(last_bar["low"]) <= limit_price:
+                    pos_mgr.open_position(lim)
+                    log_trade_entry(lim)
+                    logger.info("  LIMIT FILLED MR_CHOP %s %s: fill=%.6g waited=%.0fs",
+                                side_lim.upper(), sym_lim, limit_price, elapsed)
+                    expired_keys.append(limit_key)
+                    continue
+
+        # Expired? (3 minutes)
+        if elapsed >= lim.get("limit_expiry_mins", 3) * 60:
+            logger.info("  MISSED MR_CHOP %s %s: price=%.6g expired after %.0fs",
+                        side_lim.upper(), sym_lim, limit_price, elapsed)
+            expired_keys.append(limit_key)
+
+    for k in expired_keys:
+        pending_limits.pop(k, None)
 
     # Log cycle summary
     n_open = len(pos_mgr.positions)
@@ -834,12 +929,13 @@ def main():
     logger.info("  Interval: %ds | Min vol: $%s | Top N: %d",
                 args.interval, f"{min_vol:,.0f}" if (min_vol := args.min_vol) else "0",
                 args.top_n)
-    logger.info("  Strategies: MR=%s  StrictMR=%s  Momo=%s  Depth=%s  DepthBounce=%s  (min DPS=%d)",
+    logger.info("  Strategies: MR=%s  StrictMR=%s  Momo=%s  Depth=%s  DepthBounce=%s  BB=%s  (min DPS=%d)",
                 "ON" if _strategy_cfg.enable_mean_reversion else "OFF",
                 "ON" if _strategy_cfg.enable_strict_mr else "OFF",
                 "ON" if _strategy_cfg.enable_momentum else "OFF",
                 "ON" if _strategy_cfg.enable_depth else "OFF",
                 "ON" if _strategy_cfg.enable_depth_bounce else "OFF",
+                "ON" if _strategy_cfg.enable_bouncy_ball else "OFF",
                 _strategy_cfg.min_dps_live)
     logger.info("  Approved symbols: %d (from %s)", len(_approved_symbols),
                 APPROVED_SYMBOLS_FILE if _approved_symbols else "NONE - all allowed")
@@ -848,17 +944,18 @@ def main():
 
     candle_cache = {}  # {symbol: DataFrame} - avoids re-fetching full history
     depth_cooldown = {}  # {symbol: cycle_num} - cooldown for depth re-entry
+    pending_limits = {}  # {key: setup} - pending limit orders for mr_chop
     market_cond = MarketCondition()
 
     if args.once:
-        trading_cycle(pos_mgr, args.min_vol, args.top_n, 1, candle_cache, depth_cooldown, market_cond)
+        trading_cycle(pos_mgr, args.min_vol, args.top_n, 1, candle_cache, depth_cooldown, market_cond, pending_limits)
         return
 
     cycle = 0
     while True:
         cycle += 1
         try:
-            trading_cycle(pos_mgr, args.min_vol, args.top_n, cycle, candle_cache, depth_cooldown, market_cond)
+            trading_cycle(pos_mgr, args.min_vol, args.top_n, cycle, candle_cache, depth_cooldown, market_cond, pending_limits)
         except KeyboardInterrupt:
             logger.info("Stopped by user")
             break
