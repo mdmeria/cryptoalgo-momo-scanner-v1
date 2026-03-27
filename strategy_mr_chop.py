@@ -32,10 +32,9 @@ class MRChopSettings:
     max_last_swing_mins: int = 30
 
     # Entry/exit
-    sl_pct: float = 1.0
-    min_rr: float = 0.8
+    sl_pct: float = 1.0              # fallback SL if < 3 swings
+    min_rr: float = 1.0
     max_rr: float = 1.5
-    cap_rr: float = 1.25
     min_tp_pct: float = 0.5
 
     # Pre-trend
@@ -288,42 +287,95 @@ def check_range_shift_setup(df: pd.DataFrame, bar_idx: int,
             if c[i] <= level:
                 continue
 
-        # TP from swing depth (match backtest exactly)
+        # TP from swing depth (no cap)
         recent = swings[-3:]
         depths = [s['depth_pct'] for s in recent]
         tp_depth_pct = min(depths) * 0.95
 
         entry = level
-        sl_pct = cfg.sl_pct
+
+        # SL at second swing low/high, capped at 1.5%
+        max_sl_pct = 1.5
+        if len(swings) >= 3:
+            s1_bar = swings[-3]['bar']
+            s2_bar = swings[-2]['bar']
+            if side == "short":
+                swing_extreme = np.max(h[s1_bar:s2_bar]) if s2_bar > s1_bar else h[s1_bar]
+                sl = swing_extreme * 1.002
+            else:
+                swing_extreme = np.min(l[s1_bar:s2_bar]) if s2_bar > s1_bar else l[s1_bar]
+                sl = swing_extreme * 0.998
+            # If SL > 1.5%, use SL = 90% of TP instead
+            sl_check = abs(entry - sl) / entry * 100
+            if sl_check > max_sl_pct:
+                fallback_sl_dist = tp_depth_pct * 0.95 * 0.9 / 100 * entry
+                if side == "short":
+                    sl = entry + fallback_sl_dist
+                else:
+                    sl = entry - fallback_sl_dist
+        else:
+            if side == "short":
+                sl = level * (1 + cfg.sl_pct / 100)
+            else:
+                sl = level * (1 - cfg.sl_pct / 100)
+
         if side == "short":
-            sl = level * (1 + sl_pct / 100)
             tp = level * (1 - tp_depth_pct / 100)
         else:
-            sl = level * (1 - sl_pct / 100)
             tp = level * (1 + tp_depth_pct / 100)
 
-        # TP% and RR calculated same as backtest
+        sl_dist = abs(entry - sl)
+        sl_p = sl_dist / entry * 100
         tp_p = tp_depth_pct * 0.95
-        rr = tp_p / sl_pct if sl_pct > 0 else 0
+        rr = tp_p / sl_p if sl_p > 0 else 0
 
-        # RR cap
-        if rr > cfg.max_rr:
-            rr = cfg.cap_rr
-            cap_dist = abs(entry - sl) * cfg.cap_rr
-            if side == "short":
-                tp = entry - cap_dist
-            else:
-                tp = entry + cap_dist
-            tp_p = cap_dist / entry * 100
-
-        if rr < cfg.min_rr or tp_p < cfg.min_tp_pct:
+        # RR filter: 1.0 - 1.5
+        if rr < 1.0 or rr > 1.5 or tp_p < cfg.min_tp_pct or sl_p < 0.3:
             continue
 
-        # DPS
+        # Approach quality: full swing from opposite extreme to level
+        last_swing = swings[-1]
+        last_swing_bar = last_swing['bar']
+        prev_touch_bar = swings[-2]['bar'] if len(swings) >= 2 else max(chop_start, last_swing_bar - 60)
+
+        if side == "long":
+            segment_h = h[prev_touch_bar:last_swing_bar]
+            if len(segment_h) > 0:
+                peak_idx = prev_touch_bar + np.argmax(segment_h)
+                journey_bars = last_swing_bar - peak_idx
+                journey_pct = (h[peak_idx] - level) / level * 100
+            else:
+                journey_bars, journey_pct = 1, 0
+        else:
+            segment_l = l[prev_touch_bar:last_swing_bar]
+            if len(segment_l) > 0:
+                trough_idx = prev_touch_bar + np.argmin(segment_l)
+                journey_bars = last_swing_bar - trough_idx
+                journey_pct = (level - l[trough_idx]) / level * 100
+            else:
+                journey_bars, journey_pct = 1, 0
+
+        if journey_bars > 0 and journey_pct > 0:
+            if journey_bars <= 3 and journey_pct >= 0.5:
+                approach_type = "spike"
+                approach_qual = 2
+            elif journey_pct / journey_bars >= 0.1:
+                approach_type = "unclear"
+                approach_qual = 1
+            else:
+                approach_type = "grind"
+                approach_qual = 0
+        else:
+            approach_type = "unclear"
+            approach_qual = 1
+
+        # Recency
+        recency_score = 2 if last_sw_mins <= 5 else (1 if last_sw_mins <= 15 else 0)
+
+        # DPS = duration + approach + volume
         dur_score = 2 if chop_dur / 60 >= 4 else (1 if chop_dur / 60 >= 2 else 0)
-        app_score = 2 if last_sw_mins <= 5 else (1 if last_sw_mins <= 15 else 0)
         vol_score, vol_type = _score_volume(v, i, side)
-        dps = dur_score + app_score + vol_score
+        dps = dur_score + approach_qual + vol_score
 
         depth_str = "/".join(f"{d:.1f}%" for d in depths)
         touch_str = "/".join(s['touch_type'] for s in recent)
@@ -335,20 +387,23 @@ def check_range_shift_setup(df: pd.DataFrame, bar_idx: int,
             "entry": round(entry, 8),
             "tp": round(tp, 8),
             "sl": round(sl, 8),
-            "sl_pct": round(sl_pct, 3),
+            "sl_pct": round(sl_p, 3),
             "tp_pct": round(tp_p, 3),
             "rr": round(rr, 2),
             "n_swings": len(swings),
             "last_swing_mins": last_sw_mins,
+            "recency_score": recency_score,
             "swing_depths": depth_str,
             "touch_types": touch_str,
+            "approach_type": approach_type,
+            "approach_score": approach_qual,
             "level_source": source,
             "chop_hrs": round(chop_dur / 60, 1),
             "pre_trend": pre,
             "pre_trend_pct": round(pre_pct, 2),
             "dps_total": dps,
             "dps_dur": dur_score,
-            "dps_app": app_score,
+            "dps_app": approach_qual,
             "dps_vol": vol_score,
             "vol_type": vol_type,
         }

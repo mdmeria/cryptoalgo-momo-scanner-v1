@@ -124,7 +124,7 @@ def log_new_coin(symbol: str, volume_5m: float = 0, trades_5m: int = 0):
 
 # How many 1m bars we need for each strategy
 MR_WARMUP_BARS = 800    # MR scanner needs up to 720 + buffer
-MOMO_WARMUP_BARS = 400  # Momo needs ~370 bars
+MOMO_WARMUP_BARS = 150  # Momo needs smma30 + 120 bar staircase check
 
 # Dummy account settings (loaded from strategy_config.json via _strategy_cfg)
 
@@ -686,10 +686,20 @@ def trading_cycle(pos_mgr: PositionManager,
                 limit_key = f"{sym}_mr_chop"
                 if limit_key not in pending_limits:
                     import time as _time
+                    # Fetch depth data for logging
+                    mr_depth_alt = None
+                    if depth_data:
+                        try:
+                            mr_depth_alt = get_depth_alternative(
+                                sym, depth_data, current_close,
+                                setup["side"], strat)
+                        except Exception:
+                            pass
                     pending_limits[limit_key] = {
                         **setup,
                         "placed_at": _time.time(),
                         "limit_price": setup["entry"],
+                        "depth_alt": mr_depth_alt,
                     }
                     variant = setup.get("strategy_variant", "mr_chop_v2")
                     logger.info("  LIMIT MR_CHOP(%s) %s %s: price=%.6g tp=%.6g(%.2f%%) "
@@ -700,6 +710,12 @@ def trading_cycle(pos_mgr: PositionManager,
                                 setup["rr"], setup["dps_total"],
                                 setup.get("level_source", "?"),
                                 setup.get("n_swings", 0))
+                    if mr_depth_alt:
+                        logger.info("    DEPTH alt: tp=%.6g(%.2f%%) sl=%.6g(%.2f%%) RR=%.2f wall=$%s",
+                                    mr_depth_alt["depth_tp"], mr_depth_alt["depth_tp_pct"],
+                                    mr_depth_alt["depth_sl"], mr_depth_alt["depth_sl_pct"],
+                                    mr_depth_alt["depth_rr"],
+                                    f"{mr_depth_alt['depth_sl_wall_usd']:,.0f}")
                 continue  # don't open position yet — wait for fill
 
             # Depth comparison (use already-fetched depth_data)

@@ -240,7 +240,7 @@ def detect_setups(df: pd.DataFrame, symbol: str,
 
     # --- Momentum ---
     if config.enable_momentum and momo_cfg is not None:
-        if len(df) >= 500:
+        if len(df) >= 150:
             df_sorted = df.sort_values("timestamp").reset_index(drop=True)
             df_indexed = df_sorted.set_index("timestamp").copy()
             df_indexed.index = pd.to_datetime(df_indexed.index, utc=True)
@@ -261,7 +261,8 @@ def detect_setups(df: pd.DataFrame, symbol: str,
                 rr = result["rr"]
                 tp_source = "strategy"
 
-                # Override TP with depth wall if available and better
+                # Log depth wall info for evaluation (don't use for TP placement)
+                depth_wall_info = {}
                 if depth_data is not None:
                     try:
                         from depth_tp_sl_analyzer import compute_depth_tp_sl
@@ -269,15 +270,15 @@ def detect_setups(df: pd.DataFrame, symbol: str,
                             depth_data, entry, side=direction,
                             strategy="momentum", min_tp_pct=1.0, min_rr=1.0)
                         best = depth_result.get("best_combo")
-                        if best and best["tp"]["dist_pct"] > tp_pct:
-                            # Depth TP is wider — use it
-                            depth_tp = best["tp"]["price"]
-                            depth_tp_pct = best["tp"]["dist_pct"]
-                            depth_rr = depth_tp_pct / sl_pct if sl_pct > 0 else rr
-                            tp = round(depth_tp, 8)
-                            tp_pct = round(depth_tp_pct, 3)
-                            rr = round(depth_rr, 2)
-                            tp_source = "depth"
+                        if best:
+                            depth_wall_info = {
+                                "depth_tp": round(best["tp"]["price"], 8),
+                                "depth_tp_pct": round(best["tp"]["dist_pct"], 3),
+                                "depth_tp_wall_usd": round(best["tp"].get("wall_usd", 0), 0),
+                                "depth_tp_wall_strength": round(best["tp"].get("wall_strength", 0), 1),
+                                "depth_sl_wall_usd": round(best["sl"].get("wall_usd", 0), 0),
+                                "depth_sl_wall_strength": round(best["sl"].get("wall_strength", 0), 1),
+                            }
                     except Exception:
                         pass
 
@@ -298,6 +299,7 @@ def detect_setups(df: pd.DataFrame, symbol: str,
                     "vol_trend": result["vol_trend"],
                     "duration_hrs": result["duration_hrs"],
                     "tp_source": tp_source,
+                    **depth_wall_info,
                 }
                 setups.append(setup)
                 break  # Only take one direction per symbol

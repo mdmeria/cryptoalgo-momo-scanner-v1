@@ -317,37 +317,111 @@ for dd, fn in files:
                 if c[i] <= level:
                     continue
 
-            # TP = shallowest depth of last 3 swings
+            # TP = shallowest depth of last 3 swings (no cap)
             recent = swings[-3:]
             depths = [s['depth_pct'] for s in recent]
             tp_depth_pct = min(depths) * 0.95
 
             entry = level
-            sl_pct = 1.0
+
+            # SL at second swing low/high, capped at 1.5%
+            max_sl_pct = 1.5
+            if len(swings) >= 3:
+                s1_bar = swings[-3]['bar']
+                s2_bar = swings[-2]['bar']
+                if side == "short":
+                    swing_extreme = np.max(h[s1_bar:s2_bar]) if s2_bar > s1_bar else h[s1_bar]
+                    sl_v = swing_extreme * 1.002
+                else:
+                    swing_extreme = np.min(l[s1_bar:s2_bar]) if s2_bar > s1_bar else l[s1_bar]
+                    sl_v = swing_extreme * 0.998
+                # If SL > 1.5%, use SL = 90% of TP
+                sl_check = abs(entry - sl_v) / entry * 100
+                if sl_check > max_sl_pct:
+                    fallback_sl_dist = tp_depth_pct * 0.95 * 0.9 / 100 * entry
+                    if side == "short":
+                        sl_v = entry + fallback_sl_dist
+                    else:
+                        sl_v = entry - fallback_sl_dist
+            else:
+                if side == "short":
+                    sl_v = level * 1.01
+                else:
+                    sl_v = level * 0.99
+
             if side == "short":
-                sl_v = level * 1.01
                 tp_v = level * (1 - tp_depth_pct / 100)
             else:
-                sl_v = level * 0.99
                 tp_v = level * (1 + tp_depth_pct / 100)
 
+            sl_dist = abs(entry - sl_v)
+            sl_pct = sl_dist / entry * 100
             tp_p = tp_depth_pct * 0.95
             rr = tp_p / sl_pct if sl_pct > 0 else 0
 
-            if rr > 1.5:
-                rr = 1.25
-                cap_dist = abs(entry - sl_v) * 1.25
-                tp_v = entry - cap_dist if side == "short" else entry + cap_dist
-                tp_p = cap_dist / entry * 100
-
-            if rr < 0.8 or tp_p < 0.5:
+            if rr < 1.0 or rr > 1.5 or tp_p < 0.5 or sl_pct < 0.3:
                 continue
 
-            # DPS
+            # Approach quality: how did price travel from the opposite swing extreme
+            # back to our level? Measure full journey, not just last few bars.
+            last_swing = swings[-1]
+            last_swing_bar = last_swing['bar']
+
+            # Find the deepest point (opposite extreme) between previous touch and this touch
+            if len(swings) >= 2:
+                prev_touch_bar = swings[-2]['bar']
+            else:
+                prev_touch_bar = max(chop_start, last_swing_bar - 60)
+
+            if side == "long":
+                # For long: price went UP (away) then came DOWN to support
+                # Find the peak between prev touch and this touch
+                segment_h = h[prev_touch_bar:last_swing_bar]
+                if len(segment_h) > 0:
+                    peak_idx = prev_touch_bar + np.argmax(segment_h)
+                    peak_price = h[peak_idx]
+                    # Journey = peak to level touch
+                    journey_bars = last_swing_bar - peak_idx
+                    journey_pct = (peak_price - level) / level * 100
+                else:
+                    journey_bars = 1
+                    journey_pct = 0
+            else:
+                # For short: price went DOWN (away) then came UP to resistance
+                # Find the trough between prev touch and this touch
+                segment_l = l[prev_touch_bar:last_swing_bar]
+                if len(segment_l) > 0:
+                    trough_idx = prev_touch_bar + np.argmin(segment_l)
+                    trough_price = l[trough_idx]
+                    journey_bars = last_swing_bar - trough_idx
+                    journey_pct = (level - trough_price) / level * 100
+                else:
+                    journey_bars = 1
+                    journey_pct = 0
+
+            # Classify: spike = fast journey (few bars), grind = slow (many bars)
+            if journey_bars > 0 and journey_pct > 0:
+                speed = journey_pct / journey_bars  # % per bar
+                if journey_bars <= 3 and journey_pct >= 0.5:
+                    approach_type = "spike"
+                    approach_qual = 2
+                elif speed >= 0.1:  # > 0.1% per bar = moderately fast
+                    approach_type = "unclear"
+                    approach_qual = 1
+                else:
+                    approach_type = "grind"
+                    approach_qual = 0
+            else:
+                approach_type = "unclear"
+                approach_qual = 1
+
+            # Recency: how long ago was last swing
+            recency_score = 2 if last_sw_mins <= 5 else (1 if last_sw_mins <= 15 else 0)
+
+            # DPS = duration + approach_quality + volume (ZCT scoring)
             dur_score = 2 if chop_dur / 60 >= 4 else (1 if chop_dur / 60 >= 2 else 0)
-            app_score = 2 if last_sw_mins <= 5 else (1 if last_sw_mins <= 15 else 0)
             vol_score, vol_type = score_volume(v, i, side)
-            dps = dur_score + app_score + vol_score
+            dps = dur_score + approach_qual + vol_score
 
             # Outcome with trail SL
             fb = min(120, n - i - 1)
@@ -387,10 +461,11 @@ for dd, fn in files:
             results.append({
                 'sym': sym, 'side': side, 'ts': ts[i],
                 'entry': round(entry, 8), 'tp': round(tp_v, 8), 'sl': round(sl_v, 8),
-                'tp_p': round(tp_p, 2), 'rr': round(rr, 2),
+                'tp_p': round(tp_p, 2), 'sl_p': round(sl_pct, 2), 'rr': round(rr, 2),
                 'sw': len(swings), 'src': source, 'lst': last_sw_mins,
+                'appr': approach_type, 'appr_q': approach_qual, 'rec': recency_score,
                 'depths': depth_str, 'touches': touch_types,
-                'dps': dps, 'dur': dur_score, 'app': app_score, 'vol': vol_score,
+                'dps': dps, 'dur': dur_score, 'app': approach_qual, 'vol': vol_score,
                 'vol_type': vol_type, 'pre': pre,
                 'chop': round(chop_dur / 60, 1),
                 'out': out,
@@ -442,9 +517,27 @@ for a, b, lb in [(0, 0.8, '<0.8%'), (0.8, 1.0, '0.8-1.0%'), (1.0, 1.5, '1.0-1.5%
         wr = t / (t + s) * 100 if t + s > 0 else 0
         print(f"  {lb}: {len(sub)}, TP={t} SL={s} WR={wr:.1f}%")
 
+print("\nBy Approach Type:")
+for at in ['spike', 'unclear', 'grind']:
+    sub = [r for r in results if r['appr'] == at]
+    t = sum(1 for r in sub if r['out'] == 'TP')
+    s = sum(1 for r in sub if r['out'] in ('SL', 'TRAIL_SL'))
+    if sub:
+        wr = t / (t + s) * 100 if t + s > 0 else 0
+        print(f"  {at}: {len(sub)}, TP={t} SL={s} WR={wr:.1f}%")
+
+print("\nBy Recency:")
+for a, b, lb in [(0, 6, '<=5m'), (6, 16, '6-15m'), (16, 31, '16-30m')]:
+    sub = [r for r in results if a <= r['lst'] < b]
+    t = sum(1 for r in sub if r['out'] == 'TP')
+    s = sum(1 for r in sub if r['out'] in ('SL', 'TRAIL_SL'))
+    if sub:
+        wr = t / (t + s) * 100 if t + s > 0 else 0
+        print(f"  {lb}: {len(sub)}, TP={t} SL={s} WR={wr:.1f}%")
+
 print()
 results.sort(key=lambda x: (x['dps'], x['sw'], x['rr']), reverse=True)
-print(f"{'Symbol':>14} {'Side':>5} {'DPS':>3} {'D':>1}{'A':>1}{'V':>1} {'Vol':>4} {'Pre':>4} {'Src':>8} {'Entry':>10} {'TP':>10} {'SL':>10} {'TP%':>5} {'RR':>4} {'Sw':>2} {'Lst':>3} {'Depths':>20} {'TouchTypes':>15} {'Chp':>4} {'Out':>6} {'Time'}")
-print("-" * 170)
+print(f"{'Symbol':>14} {'Side':>5} {'DPS':>3} {'D':>1}{'A':>1}{'V':>1} {'Appr':>7} {'Rec':>3} {'Vol':>4} {'Pre':>4} {'Src':>8} {'Entry':>10} {'TP':>10} {'SL':>10} {'TP%':>5} {'SL%':>5} {'RR':>4} {'Sw':>2} {'Lst':>3} {'Depths':>20} {'Chp':>4} {'Out':>6} {'Time'}")
+print("-" * 175)
 for r in results:
-    print(f"{r['sym']:>14} {r['side']:>5} {r['dps']:>3} {r['dur']}{r['app']}{r['vol']} {r['vol_type'][:4]:>4} {r['pre']:>4} {r['src']:>8} {r['entry']:>10.6g} {r['tp']:>10.6g} {r['sl']:>10.6g} {r['tp_p']:>5.2f} {r['rr']:>4.1f} {r['sw']:>2} {r['lst']:>2}m {r['depths']:>20} {r['touches']:>15} {r['chop']:>3.0f}h {r['out']:>6} {r['ts']}")
+    print(f"{r['sym']:>14} {r['side']:>5} {r['dps']:>3} {r['dur']}{r['appr_q']}{r['vol']} {r['appr']:>7} {r['rec']:>3} {r['vol_type'][:4]:>4} {r['pre']:>4} {r['src']:>8} {r['entry']:>10.6g} {r['tp']:>10.6g} {r['sl']:>10.6g} {r['tp_p']:>5.2f} {r['sl_p']:>5.2f} {r['rr']:>4.1f} {r['sw']:>2} {r['lst']:>2}m {r['depths']:>20} {r['chop']:>3.0f}h {r['out']:>6} {r['ts']}")

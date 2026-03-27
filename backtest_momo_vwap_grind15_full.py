@@ -379,15 +379,13 @@ def gate_smma_trend(df_slice: pd.DataFrame, side: str, cfg: GateSettings) -> Tup
 
     close_s  = left["close"].to_numpy(dtype=float)
     smma30_s = left["smma30"].to_numpy(dtype=float)
-    smma120_s = left["smma120"].to_numpy(dtype=float)
 
     # Drop leading NaN warmup bars
-    valid = ~(np.isnan(smma30_s) | np.isnan(smma120_s) | np.isnan(close_s))
+    valid = ~(np.isnan(smma30_s) | np.isnan(close_s))
     if valid.sum() < 30:
         return True, ""
     close_s   = close_s[valid]
     smma30_s  = smma30_s[valid]
-    smma120_s = smma120_s[valid]
 
     # --- Check 1: smma30 trending in the right direction ---
     smma_trending = bool(smma30_s[-1] > smma30_s[0]) if is_long else bool(smma30_s[-1] < smma30_s[0])
@@ -423,19 +421,15 @@ def gate_smma_trend(df_slice: pd.DataFrame, side: str, cfg: GateSettings) -> Tup
                     tentative_run = 1
     noise_ok = crossovers <= 3
 
-    # --- Check 3: smma30 and smma120 stay in correct order (no criss-cross) ---
-    gap = smma30_s - smma120_s
-    no_smma_cross = bool((gap > 0).all()) if is_long else bool((gap < 0).all())
+    # Check 3 removed — no longer need smma120, using smma30 only with 150 bars
 
-    passed = smma_trending and noise_ok and no_smma_cross
+    passed = smma_trending and noise_ok
     if not passed:
         reasons = []
         if not smma_trending:
             reasons.append("smma30_sideways")
         if not noise_ok:
             reasons.append(f"crosses={crossovers}>3")
-        if not no_smma_cross:
-            reasons.append("smma30_120_cross")
         return False, ";".join(reasons)
     return True, ""
 
@@ -1146,16 +1140,16 @@ def check_momo_gates_at_bar(df_slice: pd.DataFrame, side: str,
     dur_hrs = streak / 60.0
     dps_v1 = 2 if dur_hrs >= 4 else (1 if dur_hrs >= 2 else 0)
 
-    # V2: Approach
-    approach_bars = closes_arr[-10:]
-    if len(approach_bars) >= 10:
+    # V2: Approach (last 15 bars)
+    approach_bars = closes_arr[-15:]
+    if len(approach_bars) >= 15:
         net = (approach_bars[-1] - approach_bars[0]) / abs(approach_bars[0]) if approach_bars[0] != 0 else 0
         diffs = np.diff(approach_bars)
         opposite = int(np.sum(diffs < 0)) if is_long else int(np.sum(diffs > 0))
-        grind_ok = (net > 0 if is_long else net < 0) and opposite <= 3
+        grind_ok = (net > 0 if is_long else net < 0) and opposite <= 7
         if grind_ok:
             dps_v2, approach_lbl = 2, "grind"
-        elif opposite <= 5:
+        elif opposite <= 10:
             dps_v2, approach_lbl = 1, "unclear"
         else:
             dps_v2, approach_lbl = 0, "spike"
@@ -1364,21 +1358,21 @@ def scan_symbol(
             dps_v1 = 2 if dur_hrs >= 4 else (1 if dur_hrs >= 2 else 0)
 
             # V2: Approach — Spike=0, Unclear=1, Grind=2
-            # Check last 10 bars for slow grind approach
-            approach_bars = closes_arr[-10:]
-            if len(approach_bars) >= 10:
+            # Check last 15 bars for slow grind approach
+            approach_bars = closes_arr[-15:]
+            if len(approach_bars) >= 15:
                 net = (approach_bars[-1] - approach_bars[0]) / abs(approach_bars[0]) if approach_bars[0] != 0 else 0
                 diffs = np.diff(approach_bars)
                 if is_long:
                     opposite = int(np.sum(diffs < 0))
-                    grind_ok = net > 0 and opposite <= 3
+                    grind_ok = net > 0 and opposite <= 7
                 else:
                     opposite = int(np.sum(diffs > 0))
-                    grind_ok = net < 0 and opposite <= 3
+                    grind_ok = net < 0 and opposite <= 7
                 if grind_ok:
                     dps_v2 = 2
                     approach_lbl = "grind"
-                elif opposite <= 5:
+                elif opposite <= 10:
                     dps_v2 = 1
                     approach_lbl = "unclear"
                 else:

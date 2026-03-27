@@ -11,7 +11,7 @@
   "enable_tp_sl_keylevel_gate": true,
   "enable_rr_guard": true,
   "enable_min_tp_sl_pct_gate": true,
-  "enable_last15m_gate": true,
+  "enable_last15m_gate": false,
 
   "grind10_min": 0.52,
   "wick_ratio_10m_max": 0.55,
