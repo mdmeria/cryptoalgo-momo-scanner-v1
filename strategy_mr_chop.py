@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Mean Reversion Chop Strategy v2
+Mean Reversion Chop Strategy v3
 
-Level detection: 15-min and 1-hour high/low candle bodies
-Swing respect: max 5 consecutive closes beyond level, then recovery
-TP: shallowest of last 3 respected swing depths × 0.95
-SL: 1% beyond level
+Level detection: Regression channel edges from the chop window
+  - Low R² = sideways/choppy, channel width = range
+  - Entry at channel edge, TP at opposite edge, SL beyond entry edge
+Swing respect: validates that channel edges are actually respected
 DPS: ZCT scoring (duration + approach + volume, side-specific)
 Entry: limit order at level price, 3-min expiry
 """
@@ -18,23 +18,29 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from scan_momo_quality import calc_regression as _calc_regression
+
 
 @dataclass
 class MRChopSettings:
     """Settings for MR chop strategy."""
-    # Choppiness
-    min_chop_ratio: float = 0.25
-    chop_durations: tuple = (360, 180)
+    # Choppiness (R²-based)
+    max_chop_r2: float = 0.3           # R² below this = choppy (no trend)
+    max_chop_channel: float = 4.0      # max channel width % for chop range
+    min_chop_channel: float = 1.0      # min channel — needs room for TP > SL
+    min_chop_bars: int = 120           # min 2 hours of chop
 
     # Level respect
     max_breach_bars: int = 5
-    min_respected_swings: int = 3
+    min_respected_swings: int = 3       # need 3 prior bounces, enter on 4th+
     max_last_swing_mins: int = 30
+    min_swing_depth_ratio: float = 0.3  # swing must bounce >= 30% of channel width
+    min_containment_pct: float = 90.0   # % of bars that must be inside channel
 
     # Entry/exit
-    sl_pct: float = 1.0              # fallback SL if < 3 swings
+    sl_tp_ratio: float = 0.9           # SL = 90% of TP distance (RR ~1.11)
+    tp_discount: float = 0.90          # TP targets 90% of channel width
     min_rr: float = 1.0
-    max_rr: float = 1.5
     min_tp_pct: float = 0.5
 
     # Pre-trend
@@ -45,24 +51,101 @@ class MRChopSettings:
     limit_expiry_mins: int = 3
 
 
-def _detect_choppy(closes, end_bar, cfg: MRChopSettings):
-    """Detect if recent price action is choppy."""
-    for dur in cfg.chop_durations:
-        s = end_bar - dur
+def _compute_channel(closes, highs, lows):
+    """
+    Compute regression R² for chop detection, plus percentile-based
+    range bounds from actual highs/lows where price repeatedly turned.
+    """
+    n = len(closes)
+    if n < 30:
+        return None
+
+    x = np.arange(n, dtype=float)
+    xm, ym = np.mean(x), np.mean(closes)
+    sxy = np.sum((x - xm) * (closes - ym))
+    sxx = np.sum((x - xm) ** 2)
+    syy = np.sum((closes - ym) ** 2)
+
+    if sxx == 0 or syy == 0:
+        return None
+
+    slope = sxy / sxx
+    r2 = (sxy ** 2) / (sxx * syy)
+
+    # Range bounds from actual price action (percentile-based)
+    # 95th percentile of highs = resistance, 5th percentile of lows = support
+    # This captures where price actually turned, trimming spike wicks
+    upper = np.percentile(highs, 95)
+    lower = np.percentile(lows, 5)
+    center = (upper + lower) / 2
+    channel_pct = (upper - lower) / center * 100 if center > 0 else 0
+
+    return {
+        "r2": r2,
+        "channel_pct": channel_pct,
+        "center": center,
+        "upper": upper,
+        "lower": lower,
+        "slope": slope,
+        "slope_pct": slope / center * 100 if center > 0 else 0,
+    }
+
+
+def _detect_choppy(closes, highs, lows, end_bar, cfg: MRChopSettings):
+    """
+    Detect chop using R² regression — low R² = sideways/choppy.
+    Walks backwards expanding the window to find where chop started.
+
+    Returns (chop_start, chop_dur, channel_info) or None.
+    """
+    if end_bar < 240:
+        return None
+
+    # Step 1: Check if current 120-bar window is choppy
+    ch = _compute_channel(closes[end_bar - 120:end_bar],
+                          highs[end_bar - 120:end_bar],
+                          lows[end_bar - 120:end_bar])
+    if ch is None:
+        return None
+    if ch["r2"] >= cfg.max_chop_r2:
+        return None
+    if ch["channel_pct"] > cfg.max_chop_channel:
+        return None
+    if ch["channel_pct"] < cfg.min_chop_channel:
+        return None
+
+    # Step 2: Walk backwards to find where chop started
+    chop_start = end_bar - 120
+    max_lookback = min(end_bar, 720)
+
+    for step_back in range(150, max_lookback, 30):
+        s = end_bar - step_back
         if s < 0:
-            continue
-        cc = closes[s:end_bar]
-        if len(cc) < 100:
-            continue
-        smooth = np.convolve(cc, np.ones(10) / 10, mode='valid')
-        if len(smooth) < 30:
-            continue
-        diffs = np.diff(smooth)
-        sign_changes = np.sum(np.diff(np.sign(diffs)) != 0)
-        ratio = sign_changes / len(diffs)
-        if ratio > cfg.min_chop_ratio:
-            return s, dur
-    return None
+            break
+        seg_ch = _compute_channel(closes[s:end_bar], highs[s:end_bar], lows[s:end_bar])
+        if seg_ch is None:
+            break
+        if seg_ch["r2"] >= cfg.max_chop_r2:
+            chop_start = s + 30
+            break
+        chop_start = s
+
+    chop_dur = end_bar - chop_start
+    if chop_dur < cfg.min_chop_bars:
+        return None
+
+    # Step 3: Recompute channel on the final chop window
+    final = _compute_channel(closes[chop_start:end_bar],
+                             highs[chop_start:end_bar],
+                             lows[chop_start:end_bar])
+    if final is None:
+        return None
+    if final["channel_pct"] > cfg.max_chop_channel:
+        return None
+    if final["channel_pct"] < cfg.min_chop_channel:
+        return None
+
+    return chop_start, chop_dur, final
 
 
 def _detect_pre_trend(closes, highs, lows, chop_start, cfg: MRChopSettings):
@@ -86,44 +169,12 @@ def _detect_pre_trend(closes, highs, lows, chop_start, cfg: MRChopSettings):
     return "flat", 0.0
 
 
-def _find_tf_levels(highs, lows, closes, opens, end_bar):
-    """Find levels from 15-min and 1-hour candle highs/lows."""
-    levels = []
-
-    for tf_bars, tf_name in [(15, '15m'), (60, '1h')]:
-        s = max(0, end_bar - tf_bars)
-        h_max = np.max(highs[s:end_bar])
-        l_min = np.min(lows[s:end_bar])
-
-        # Resistance: bodies of bars at the high
-        h_bodies = [max(opens[j], closes[j]) for j in range(s, end_bar)
-                     if highs[j] >= h_max * 0.999]
-        if h_bodies:
-            levels.append({
-                'price': np.mean(h_bodies),
-                'source': f'{tf_name}_high',
-                'side': 'short',
-            })
-
-        # Support: bodies of bars at the low
-        l_bodies = [min(opens[j], closes[j]) for j in range(s, end_bar)
-                     if lows[j] <= l_min * 1.001]
-        if l_bodies:
-            levels.append({
-                'price': np.mean(l_bodies),
-                'source': f'{tf_name}_low',
-                'side': 'long',
-            })
-
-    return levels
-
-
 def _find_respected_swings(highs, lows, closes, opens, level, start, end,
                             side, max_breach=5):
     """
     Find swings where price respected the level.
-    For longs: max N closes below level, then recovery above.
-    For shorts: max N closes above level, then recovery below.
+    For longs: price travels away from level upward, then returns to touch.
+    For shorts: price travels away from level downward, then returns to touch.
     """
     swings = []
     farthest = 0
@@ -218,8 +269,8 @@ def _score_volume(volumes, bar, side, lookback=60, skip=3):
 def check_range_shift_setup(df: pd.DataFrame, bar_idx: int,
                              cfg: MRChopSettings = None) -> dict:
     """
-    Check for MR chop setup using 15m/1h levels + respected swings.
-    This replaces both range_shift and one_sided_chop with unified v2 logic.
+    Check for MR chop setup using regression channel edges.
+    Entry at channel boundary, TP targets opposite side, SL beyond entry edge.
     """
     if cfg is None:
         cfg = MRChopSettings()
@@ -234,39 +285,53 @@ def check_range_shift_setup(df: pd.DataFrame, bar_idx: int,
     if i < 600:
         return {"passed": False, "reason": "not_enough_bars"}
 
-    # Choppy?
-    chop = _detect_choppy(c, i, cfg)
+    # Choppy? Get channel bounds
+    chop = _detect_choppy(c, h, l, i, cfg)
     if chop is None:
         return {"passed": False, "reason": "not_choppy"}
-    chop_start, chop_dur = chop
+    chop_start, chop_dur, ch_info = chop
 
     # Pre-trend
     pre, pre_pct = _detect_pre_trend(c, h, l, chop_start, cfg)
 
-    # Get candidate levels
-    tf_levels = _find_tf_levels(h, l, c, o, i)
-    if not tf_levels:
-        return {"passed": False, "reason": "no_levels"}
+    # Channel levels
+    upper_level = ch_info["upper"]
+    lower_level = ch_info["lower"]
+    center = ch_info["center"]
+    channel_width_pct = ch_info["channel_pct"]
 
-    # Filter by pre-trend
-    if pre == "up":
-        candidates = [lv for lv in tf_levels if lv['side'] == 'long']
-    elif pre == "down":
-        candidates = [lv for lv in tf_levels if lv['side'] == 'short']
-    else:
-        candidates = tf_levels
+    # Containment check: 90%+ of bars must be inside the channel
+    chop_h = h[chop_start:i]
+    chop_l = l[chop_start:i]
+    buf = (upper_level - lower_level) * 0.05  # 5% buffer on each side
+    inside = np.sum((chop_h <= upper_level + buf) & (chop_l >= lower_level - buf))
+    containment = inside / len(chop_h) * 100 if len(chop_h) > 0 else 0
+    if containment < cfg.min_containment_pct:
+        return {"passed": False, "reason": f"containment_{containment:.0f}pct"}
+
+    # Build candidates: long at lower channel, short at upper channel
+    candidates = []
+    if pre != "down":  # don't long if pre-trend is down
+        candidates.append({"price": lower_level, "side": "long", "source": "ch_lower"})
+    if pre != "up":    # don't short if pre-trend is up
+        candidates.append({"price": upper_level, "side": "short", "source": "ch_upper"})
 
     if not candidates:
         return {"passed": False, "reason": "no_aligned_levels"}
 
     for cand in candidates:
-        level = cand['price']
-        side = cand['side']
-        source = cand['source']
+        level = cand["price"]
+        side = cand["side"]
+        source = cand["source"]
 
-        # Respected swings
+        # Respected swings at this channel edge
         swings = _find_respected_swings(h, l, c, o, level, chop_start, i,
                                          side, cfg.max_breach_bars)
+
+        # Filter swings by minimum bounce depth (% of channel width)
+        min_depth = channel_width_pct * cfg.min_swing_depth_ratio
+        swings = [s for s in swings if s['depth_pct'] >= min_depth]
+
         if len(swings) < cfg.min_respected_swings:
             continue
 
@@ -287,53 +352,34 @@ def check_range_shift_setup(df: pd.DataFrame, bar_idx: int,
             if c[i] <= level:
                 continue
 
-        # TP from swing depth (no cap)
-        recent = swings[-3:]
-        depths = [s['depth_pct'] for s in recent]
-        tp_depth_pct = min(depths) * 0.95
-
+        # --- TP/SL from channel ---
         entry = level
+        channel_dist = upper_level - lower_level  # full channel width in price
 
-        # SL at second swing low/high, capped at 1.5%
-        max_sl_pct = 1.5
-        if len(swings) >= 3:
-            s1_bar = swings[-3]['bar']
-            s2_bar = swings[-2]['bar']
-            if side == "short":
-                swing_extreme = np.max(h[s1_bar:s2_bar]) if s2_bar > s1_bar else h[s1_bar]
-                sl = swing_extreme * 1.002
-            else:
-                swing_extreme = np.min(l[s1_bar:s2_bar]) if s2_bar > s1_bar else l[s1_bar]
-                sl = swing_extreme * 0.998
-            # If SL > 1.5%, use SL = 90% of TP instead
-            sl_check = abs(entry - sl) / entry * 100
-            if sl_check > max_sl_pct:
-                fallback_sl_dist = tp_depth_pct * 0.95 * 0.9 / 100 * entry
-                if side == "short":
-                    sl = entry + fallback_sl_dist
-                else:
-                    sl = entry - fallback_sl_dist
+        # TP: target opposite channel edge, discounted
+        tp_dist = channel_dist * cfg.tp_discount
+        if side == "long":
+            tp = entry + tp_dist
         else:
-            if side == "short":
-                sl = level * (1 + cfg.sl_pct / 100)
-            else:
-                sl = level * (1 - cfg.sl_pct / 100)
+            tp = entry - tp_dist
 
-        if side == "short":
-            tp = level * (1 - tp_depth_pct / 100)
+        # SL: 90% of TP distance, placed beyond entry edge
+        sl_dist_price = tp_dist * cfg.sl_tp_ratio
+        if side == "long":
+            sl = entry - sl_dist_price
         else:
-            tp = level * (1 + tp_depth_pct / 100)
+            sl = entry + sl_dist_price
 
-        sl_dist = abs(entry - sl)
-        sl_p = sl_dist / entry * 100
-        tp_p = tp_depth_pct * 0.95
+        # Compute percentages
+        tp_p = tp_dist / entry * 100
+        sl_p = sl_dist_price / entry * 100
         rr = tp_p / sl_p if sl_p > 0 else 0
 
-        # RR filter: 1.0 - 1.5
-        if rr < 1.0 or rr > 1.5 or tp_p < cfg.min_tp_pct or sl_p < 0.3:
+        # Filters
+        if rr < cfg.min_rr or tp_p < cfg.min_tp_pct or sl_p < 0.1:
             continue
 
-        # Approach quality: full swing from opposite extreme to level
+        # Approach quality
         last_swing = swings[-1]
         last_swing_bar = last_swing['bar']
         prev_touch_bar = swings[-2]['bar'] if len(swings) >= 2 else max(chop_start, last_swing_bar - 60)
@@ -377,12 +423,13 @@ def check_range_shift_setup(df: pd.DataFrame, bar_idx: int,
         vol_score, vol_type = _score_volume(v, i, side)
         dps = dur_score + approach_qual + vol_score
 
-        depth_str = "/".join(f"{d:.1f}%" for d in depths)
+        recent = swings[-3:]
+        depth_str = "/".join(f"{d['depth_pct']:.1f}%" for d in recent)
         touch_str = "/".join(s['touch_type'] for s in recent)
 
         return {
             "passed": True,
-            "strategy_variant": "mr_chop_v2",
+            "strategy_variant": "mr_chop_v3",
             "side": side,
             "entry": round(entry, 8),
             "tp": round(tp, 8),
@@ -399,6 +446,11 @@ def check_range_shift_setup(df: pd.DataFrame, bar_idx: int,
             "approach_score": approach_qual,
             "level_source": source,
             "chop_hrs": round(chop_dur / 60, 1),
+            "containment_pct": round(containment, 1),
+            "channel_pct": round(channel_width_pct, 3),
+            "r2": round(ch_info["r2"], 4),
+            "ch_upper": round(upper_level, 8),
+            "ch_lower": round(lower_level, 8),
             "pre_trend": pre,
             "pre_trend_pct": round(pre_pct, 2),
             "dps_total": dps,
@@ -413,5 +465,5 @@ def check_range_shift_setup(df: pd.DataFrame, bar_idx: int,
 
 def check_one_sided_chop_setup(df: pd.DataFrame, bar_idx: int,
                                 cfg: MRChopSettings = None) -> dict:
-    """Placeholder — v2 unified logic handles both via check_range_shift_setup."""
-    return {"passed": False, "reason": "use_range_shift_v2"}
+    """Placeholder — v3 unified logic handles both via check_range_shift_setup."""
+    return {"passed": False, "reason": "use_range_shift_v3"}
