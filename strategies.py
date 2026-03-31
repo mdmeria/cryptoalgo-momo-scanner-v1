@@ -109,6 +109,7 @@ from backtest_momo_vwap_grind15_full import (
     check_momo_gates_at_bar,
     prepare_features as prepare_momo_features,
 )
+from scan_momo_quality import calc_regression as _momo_calc_regression
 
 # ---------------------------------------------------------------------------
 # Depth-of-Book — wall-based strategy
@@ -150,6 +151,96 @@ from strategy_mr_chop import (
 # ---------------------------------------------------------------------------
 # Strategy runner — detects setups for all enabled strategies
 # ---------------------------------------------------------------------------
+
+def _momo_quality_filter(df_sorted: pd.DataFrame, side: str) -> Optional[dict]:
+    """
+    Momentum quality filter: 2h regression, split maxDD, 15m channel+slope, DPS.
+    Returns dict with quality metrics and DPS scores, or None if filtered out.
+    """
+    n = len(df_sorted)
+    if n < 150:
+        return None
+
+    c = df_sorted["close"].values.astype(float)
+    h = df_sorted["high"].values.astype(float)
+    lo = df_sorted["low"].values.astype(float)
+    v = df_sorted["volume"].values.astype(float)
+
+    end = n  # work with the full array (end is exclusive index)
+
+    # --- 2h regression (last 120 bars) ---
+    if end < 120:
+        return None
+    res_2h = _momo_calc_regression(c[end-120:end], h[end-120:end], lo[end-120:end])
+    if res_2h is None:
+        return None
+    if res_2h["r2"] <= 0.85 or res_2h["channel"] >= 1.25:
+        return None
+
+    # --- Split maxDD: first 60 bars < 1.15%, last 60 bars < 0.7% ---
+    mid = end - 60
+    res_1h_first = _momo_calc_regression(c[end-120:mid], h[end-120:mid], lo[end-120:mid])
+    res_1h_last = _momo_calc_regression(c[mid:end], h[mid:end], lo[mid:end])
+    if res_1h_first is None or res_1h_last is None:
+        return None
+    if res_1h_first["max_dd"] >= 1.15 or res_1h_last["max_dd"] >= 0.7:
+        return None
+
+    # --- 15m regression: disabled — 2-bar confirmation handles last 15m quality ---
+    # res_15 = _momo_calc_regression(c[end-15:end], h[end-15:end], lo[end-15:end])
+    # if res_15 is None:
+    #     return None
+    # if res_15["channel"] >= 0.20:
+    #     return None
+    # if side == "long" and res_15["slope"] <= 0:
+    #     return None
+    # if side == "short" and res_15["slope"] >= 0:
+    #     return None
+
+    # --- ZCT DPS: Duration ---
+    dps_dur = 1  # 2hr staircase = 1
+    if end >= 240:
+        res_4h = _momo_calc_regression(c[end-240:end], h[end-240:end], lo[end-240:end])
+        if res_4h is not None and res_4h["r2"] > 0.85:
+            dps_dur = 2
+
+    # --- ZCT DPS: Approach (always 2 — 15m channel filter = grind) ---
+    dps_app = 2
+
+    # --- ZCT DPS: Volume (side-specific) ---
+    vol_usd = v[end-30:end] * c[end-30:end]
+    vol_avg = np.mean(vol_usd)
+    if vol_avg <= 0:
+        return None
+    vol_slope = np.polyfit(np.arange(len(vol_usd)), vol_usd, 1)[0]
+    vol_norm = vol_slope / vol_avg
+    if vol_norm > 0.01:
+        vol_label = "increasing"
+    elif vol_norm < -0.01:
+        vol_label = "decreasing"
+    else:
+        vol_label = "flat"
+
+    if side == "long":
+        dps_vol = 2 if vol_label == "increasing" else (1 if vol_label == "flat" else 0)
+    else:
+        dps_vol = 2 if vol_label == "increasing" else (1 if vol_label == "decreasing" else 0)
+
+    dps_total = dps_dur + dps_app + dps_vol
+
+    return {
+        "r2_2h": round(res_2h["r2"], 4),
+        "channel_2h": round(res_2h["channel"], 4),
+        "channel_15m": 0,  # 15m filter disabled
+        "max_dd_1h_first": round(res_1h_first["max_dd"], 4),
+        "max_dd_1h_last": round(res_1h_last["max_dd"], 4),
+        "dps_dur": dps_dur,
+        "dps_app": dps_app,
+        "dps_vol": dps_vol,
+        "dps_total_quality": dps_total,
+        "vol_trend_quality": vol_label,
+    }
+
 
 def detect_setups(df: pd.DataFrame, symbol: str,
                   config: StrategyConfig,
@@ -250,6 +341,20 @@ def detect_setups(df: pd.DataFrame, symbol: str,
                 result = check_momo_gates_at_bar(df_prepped, direction, momo_cfg)
                 if not result["passed"]:
                     continue
+
+                # --- Momentum quality filter (2h R², channel, maxDD, 15m) ---
+                qf = _momo_quality_filter(df_sorted, direction)
+                if qf is None:
+                    continue
+
+                # Override DPS with quality-filter DPS
+                result["dps_total"] = qf["dps_total_quality"]
+                dps_t = qf["dps_total_quality"]
+                result["dps_confidence"] = (
+                    "max" if dps_t >= 6 else
+                    ("high" if dps_t >= 4 else
+                     ("low" if dps_t >= 3 else "avoid")))
+
                 if result["dps_total"] < config.min_dps_live:
                     continue
 
@@ -295,9 +400,17 @@ def detect_setups(df: pd.DataFrame, symbol: str,
                     "rr": rr,
                     "dps_total": result["dps_total"],
                     "dps_confidence": result["dps_confidence"],
+                    "dps_dur": qf["dps_dur"],
+                    "dps_app": qf["dps_app"],
+                    "dps_vol": qf["dps_vol"],
                     "approach": result["approach"],
-                    "vol_trend": result["vol_trend"],
+                    "vol_trend": qf["vol_trend_quality"],
                     "duration_hrs": result["duration_hrs"],
+                    "r2_2h": qf["r2_2h"],
+                    "channel_2h": qf["channel_2h"],
+                    "channel_15m": qf["channel_15m"],
+                    "max_dd_1h_first": qf["max_dd_1h_first"],
+                    "max_dd_1h_last": qf["max_dd_1h_last"],
                     "tp_source": tp_source,
                     **depth_wall_info,
                 }

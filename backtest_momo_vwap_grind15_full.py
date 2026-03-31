@@ -734,12 +734,12 @@ def gate_entry_not_crossed_6h(df_slice: pd.DataFrame, side: str) -> bool:
     entry_level = float(df_slice["high"].iloc[-1]) if is_long else float(df_slice["low"].iloc[-1])
 
     n = len(df_slice)
-    # Need at least 10 bars of recent data before the 6h lookback
-    if n < 12:
+    if n < 2:
         return True  # not enough history — pass
 
-    window_end = n - 10          # exclude last 10 bars (recent action)
-    window_start = max(0, n - 370)  # ~6h back
+    # Check full 6h window up to signal bar (no exclusion — 2-bar confirm handles continuation)
+    window_end = n - 1            # up to the bar before signal
+    window_start = max(0, n - 360)  # ~6h back
     prior = df_slice.iloc[window_start:window_end]
 
     if prior.empty:
@@ -1156,16 +1156,23 @@ def check_momo_gates_at_bar(df_slice: pd.DataFrame, side: str,
     else:
         dps_v2, approach_lbl = 0, "spike"
 
-    # V3: Volume
-    vol_usd = df_slice["volume"].values * closes_arr
-    vol_ma = pd.Series(vol_usd).ewm(alpha=1.618 / 100, adjust=False).mean().values
-    vol_now = float(vol_ma[-1])
-    vol_prev = float(vol_ma[-11]) if len(vol_ma) > 11 else vol_now
-    vol_ratio = vol_now / vol_prev if vol_prev > 0 else 1.0
-    if vol_ratio > 1.05:
-        vol_trend_lbl = "increasing"
-    elif vol_ratio < 0.95:
-        vol_trend_lbl = "decreasing"
+    # V3: Volume — 30-bar linear regression slope
+    vol_usd = df_slice["volume"].values[-30:] * closes_arr[-30:]
+    if len(vol_usd) >= 30:
+        x = np.arange(len(vol_usd), dtype=float)
+        y = vol_usd.astype(float)
+        y_mean = np.mean(y)
+        if y_mean > 1e-9:
+            slope = np.polyfit(x, y, 1)[0]
+            norm_slope = slope / y_mean * len(vol_usd)
+            if norm_slope > 0.3:
+                vol_trend_lbl = "increasing"
+            elif norm_slope < -0.3:
+                vol_trend_lbl = "decreasing"
+            else:
+                vol_trend_lbl = "flat"
+        else:
+            vol_trend_lbl = "flat"
     else:
         vol_trend_lbl = "flat"
 

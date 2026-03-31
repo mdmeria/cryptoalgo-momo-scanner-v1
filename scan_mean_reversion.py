@@ -59,7 +59,7 @@ class MRSettings:
     noise_min_crosses: int = 4          # min 30 SMMA crosses for choppy
 
     # Volume
-    vol_lookback_bars: int = 60         # 1h of volume to assess trend
+    vol_lookback_bars: int = 30         # 30 min of volume to assess trend
 
     # SL/TP
     min_sl_pct: float = 1.0
@@ -959,6 +959,38 @@ def check_mr_gates_at_bar(df: pd.DataFrame, bar_idx: int,
                 break
     if closes_at_level < 2:
         return {"passed": False, "reason": f"level_close_{closes_at_level}_of_{len(last_3_touches)}"}
+
+    # Step 4c: Weakening pattern — reject if last 2 swings show the level failing
+    # For longs: lower highs + lower lows = bearish, level weakening
+    # For shorts: higher lows + higher highs = bullish, level weakening
+    touch_indices = touches["touch_indices"]
+    if len(touch_indices) >= 2:
+        # Find peaks/troughs between consecutive touches
+        t_peaks = []
+        t_levels = []
+        for ti_idx in range(len(touch_indices)):
+            tidx = touch_indices[ti_idx]
+            t_end = touch_indices[ti_idx + 1] if ti_idx + 1 < len(touch_indices) else i
+            if entry_side == "lower":
+                t_levels.append(lows[tidx])
+                t_peaks.append(float(np.max(highs[tidx:t_end])))
+            else:
+                t_levels.append(highs[tidx])
+                t_peaks.append(float(np.min(lows[tidx:t_end])))
+
+        if len(t_peaks) >= 2:
+            if entry_side == "lower":
+                # Long: lower highs = weakening resistance bounce
+                last_lh = t_peaks[-1] < t_peaks[-2]
+                last_ll = t_levels[-1] < t_levels[-2] or lows[i] < t_levels[-1]
+                if last_lh and last_ll:
+                    return {"passed": False, "reason": "weakening_lower_highs_lower_lows"}
+            else:
+                # Short: higher lows = weakening support dip
+                last_hl = t_peaks[-1] > t_peaks[-2]
+                last_hh = t_levels[-1] > t_levels[-2] or highs[i] > t_levels[-1]
+                if last_hl and last_hh:
+                    return {"passed": False, "reason": "weakening_higher_lows_higher_highs"}
 
     # Step 5: Last touch recency
     if touches["last_touch_idx"] < 0:
