@@ -158,6 +158,7 @@ def simulate_momo_live_entry(df_c, df_h, df_l, signal_idx, side,
     n = len(df_c)
 
     # Phase 1: 2-bar confirmation (next 2 bars close beyond the level)
+    # If after 1 close beyond, the next candle closes back through → recycled level
     confirm_count = 0
     confirm_bar = None
     for cb in range(signal_idx + 1, min(signal_idx + 15, n)):
@@ -166,6 +167,10 @@ def simulate_momo_live_entry(df_c, df_h, df_l, signal_idx, side,
         elif side == "short" and df_c[cb] < level:
             confirm_count += 1
         else:
+            if confirm_count >= 1:
+                # Had 1 close beyond but next candle closed back through
+                # Level is weak/recycled — abandon entirely
+                return "MISSED", 0, "recycled_level"
             confirm_count = 0
         if confirm_count >= 2:
             confirm_bar = cb + 1
@@ -345,24 +350,22 @@ def process_symbol(sym, dataset_dir, market_score_data=None):
         if vol_5m[i] < MIN_VOL_5M_USD:
             continue
 
-        # ── CHEAPEST: market condition ──
+        # ── CHEAPEST: market condition (skip only at neutral) ──
         mkt = bar_mkt[i]
-        can_long = mkt >= 2
-        can_short = mkt <= -2
+        can_long = mkt > 0
+        can_short = mkt < 0
         if not can_long and not can_short:
             continue
 
-        # ── SIGNAL DETECTION: breakout of 6h level ──
-        # Long signal: current close > prior 6h high (first time)
-        # Short signal: current close < prior 6h low (first time)
-        # "First time" = previous bar was NOT beyond the level
+        # ── SIGNAL DETECTION: price above 6h high / below 6h low ──
+        # No "first time" requirement — cooldown handles dedup
         if np.isnan(hi6h[i]) or np.isnan(lo6h[i]):
             continue
 
         signals = []
-        if can_long and c[i] > hi6h[i] and c[i - 1] <= hi6h[i - 1]:
-            signals.append(("long", hi6h[i]))  # level = the 6h high that was broken
-        if can_short and c[i] < lo6h[i] and c[i - 1] >= lo6h[i - 1]:
+        if can_long and c[i] > hi6h[i]:
+            signals.append(("long", hi6h[i]))
+        if can_short and c[i] < lo6h[i]:
             signals.append(("short", lo6h[i]))
 
         if not signals:
@@ -428,8 +431,28 @@ def process_symbol(sym, dataset_dir, market_score_data=None):
             if avg_wick > 0.55:
                 continue
 
+            # ── GATE: Max candle size in last 15 bars < 0.5% ──
+            if i >= 15:
+                last15_range = h[i - 14:i + 1] - l[i - 14:i + 1]
+                last15_pct = last15_range / c[i - 14:i + 1] * 100
+                if np.max(last15_pct) >= 0.5:
+                    continue
+
+            # ── GATE: Max drawdown in last 2h ≤ 1% ──
+            stair_start = max(0, i - 119)
+            stair_cl = c[stair_start:i + 1]
+            stair_lo = l[stair_start:i + 1]
+            stair_hi = h[stair_start:i + 1]
+            if is_long:
+                running_peak = np.maximum.accumulate(stair_cl)
+                dd_pct = np.max((running_peak - stair_lo) / running_peak * 100)
+            else:
+                running_trough = np.minimum.accumulate(stair_cl)
+                dd_pct = np.max((stair_hi - running_trough) / running_trough * 100)
+            if dd_pct > 1.0:
+                continue
+
             # ── ALL GATES PASSED — compute SL/TP ──
-            # Entry level = the broken level (retest entry)
             entry_level = level
 
             sl_val, tp_val, sl_pct, tp_pct = compute_sl_tp(
@@ -497,7 +520,9 @@ def process_symbol(sym, dataset_dir, market_score_data=None):
                 "pnl": round(pnl, 3),
                 "mkt_score": int(mkt),
             })
-            cooldown = i + min_gap
+            # Only cooldown on filled trades, not MISSED
+            if outcome != "MISSED":
+                cooldown = i + min_gap
             break
 
     return trades
@@ -510,6 +535,9 @@ def process_symbol(sym, dataset_dir, market_score_data=None):
 def main():
     with open(LOG_FILE, "w") as f:
         f.write("")
+    # Clear output CSV for fresh run
+    if os.path.exists(OUTPUT_CSV):
+        os.remove(OUTPUT_CSV)
 
     syms = sorted([f.replace("_1m.csv", "") for f in os.listdir(DATASET_DIR) if f.endswith("_1m.csv")])
     log(f"ZCT Momo v3: {len(syms)} symbols")
@@ -521,17 +549,18 @@ def main():
     if market_data:
         log(f"  Market conditions: {len(score_vals)} checkpoints")
 
-    log(f"  Signal: breakout of 6h high/low (first close beyond)")
+    log(f"  Signal: price above 6h high / below 6h low (no first-time req)")
     log(f"  Gates: duration(2h+) + SMMA30 trending + noise(xr<=6) + grind + volume(nama30) + VWAP side")
     log(f"  Entry: 2-bar confirm + limit at broken level + 0.75R cancel")
     log(f"  SL: 2nd swing + 0.15% buffer [1-2%] | TP: SL*1.1R [max 4%]")
 
-    workers = min(8, len(syms))
+    workers = min(10, len(syms))
     log(f"  Workers: {workers}")
 
     all_trades = []
     done = 0
     t0 = time.time()
+    header_written = False
 
     with ProcessPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(process_symbol, sym, DATASET_DIR, market_data): sym for sym in syms}
@@ -542,6 +571,11 @@ def main():
                 sym_trades = future.result()
                 if sym_trades:
                     all_trades.extend(sym_trades)
+                    # Write incrementally to disk
+                    batch_df = pd.DataFrame(sym_trades)
+                    batch_df.to_csv(OUTPUT_CSV, mode="a", index=False,
+                                   header=not header_written)
+                    header_written = True
                     for t in sym_trades:
                         log(f"  {sym:>15} {t['ts'][:19]} {t['side']:>5} lvl={t['level']:.4f} "
                             f"dur={t['dur_hrs']}h xr={t['smma_crosses']} dps={t['dps']} "
@@ -557,6 +591,7 @@ def main():
 
     if all_trades:
         tdf = pd.DataFrame(all_trades)
+        # Rewrite clean sorted version
         tdf.to_csv(OUTPUT_CSV, index=False)
     else:
         tdf = pd.DataFrame()

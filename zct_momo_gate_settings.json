@@ -1,0 +1,28 @@
+{
+  "_comment": "ZCT Momo gates — aligned with 100 B+ trades PDF analysis",
+
+  "enable_2h_gate": true,
+  "enable_ema7_cross_gate": true,
+  "enable_staircase_gate": false,
+  "enable_10m_gate": false,
+  "enable_30m_noise_gate": true,
+  "enable_5m_antispike_gate": true,
+  "enable_volusd_gate": true,
+  "enable_regime_breakout_gate": false,
+  "enable_vwap_side_gate": true,
+  "enable_tp_sl_keylevel_gate": true,
+  "enable_rr_guard": true,
+  "enable_min_tp_sl_pct_gate": true,
+  "enable_last15m_gate": false,
+
+  "dir_lookback_bars": 120,
+  "noise_wick_30m_max": 0.55,
+  "spike5_max_abs_ret_pct": 1.5,
+  "spike5_max_range_pct": 2.5,
+
+  "day_change_pct": 5.0,
+  "min_profit_pct": 1.0,
+  "min_vol_usd_5m": 500000,
+  "entry_not_crossed_6h": true,
+  "rr": 1.1
+}
