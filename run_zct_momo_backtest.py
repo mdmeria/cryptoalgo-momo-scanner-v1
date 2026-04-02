@@ -118,7 +118,7 @@ def find_second_swing(arr, entry, is_long, lookback=20, buffer_pct=0.15):
 
 
 def compute_sl_tp(h_arr, l_arr, direction, entry_price,
-                  min_sl=1.0, max_sl=2.0, rr=1.1, max_tp=4.0):
+                  min_sl=1.0, max_sl=3.0, rr=1.1, max_tp=4.0):
     is_long = direction == "long"
     swing_ref = find_second_swing(
         l_arr if is_long else h_arr, entry_price, is_long)
@@ -182,7 +182,7 @@ def simulate_momo_live_entry(df_c, df_h, df_l, signal_idx, side,
     # Phase 2: limit order at the level, 10-bar expiry
     cancel_075r = level + (tp - level) * 0.75 if side == "long" else level - (level - tp) * 0.75
     fill_bar = None
-    for fb in range(confirm_bar, min(confirm_bar + 10, n)):
+    for fb in range(confirm_bar, min(confirm_bar + 15, n)):
         if side == "long" and df_h[fb] >= cancel_075r:
             return "MISSED", 0, "075r_cancel"
         if side == "short" and df_l[fb] <= cancel_075r:
@@ -431,26 +431,52 @@ def process_symbol(sym, dataset_dir, market_score_data=None):
             if avg_wick > 0.55:
                 continue
 
-            # ── GATE: Max candle size in last 15 bars < 0.5% ──
+            # ── LONG-ONLY GATE: Volume acceleration >= 1.3 ──
+            if is_long and i >= 120:
+                vol_usd_stair = vol_usd[max(0, i - 119):i + 1]
+                recent_v = np.mean(vol_usd_stair[-30:])
+                prior_v = np.mean(vol_usd_stair[:30])
+                vol_accel = recent_v / prior_v if prior_v > 0 else 1.0
+                if vol_accel < 1.3:
+                    continue
+            else:
+                vol_accel = 0.0
+
+            # ── LONG-ONLY GATE: R² of last 30 bars >= 0.5 ──
+            if is_long and i >= 30:
+                last30_c = c[i - 29:i + 1]
+                x30 = np.arange(30)
+                s30, i30 = np.polyfit(x30, last30_c, 1)
+                pred30 = s30 * x30 + i30
+                ss_res30 = np.sum((last30_c - pred30) ** 2)
+                ss_tot30 = np.sum((last30_c - np.mean(last30_c)) ** 2)
+                r2_30 = 1 - ss_res30 / ss_tot30 if ss_tot30 > 0 else 0
+                if r2_30 < 0.5:
+                    continue
+            else:
+                r2_30 = 0.0
+
+            # ── MEASURE (not gate): Candle size metrics in last 15 bars ──
             if i >= 15:
                 last15_range = h[i - 14:i + 1] - l[i - 14:i + 1]
                 last15_pct = last15_range / c[i - 14:i + 1] * 100
-                if np.max(last15_pct) >= 0.5:
-                    continue
+                max_candle_15m = float(np.max(last15_pct))
+                pct_small_15m = float(np.sum(last15_pct < 0.2) / len(last15_pct) * 100)
+            else:
+                max_candle_15m = 0.0
+                pct_small_15m = 0.0
 
-            # ── GATE: Max drawdown in last 2h ≤ 1% ──
+            # ── MEASURE (not gate): Max drawdown in last 2h ──
             stair_start = max(0, i - 119)
             stair_cl = c[stair_start:i + 1]
             stair_lo = l[stair_start:i + 1]
             stair_hi = h[stair_start:i + 1]
             if is_long:
                 running_peak = np.maximum.accumulate(stair_cl)
-                dd_pct = np.max((running_peak - stair_lo) / running_peak * 100)
+                dd_pct = float(np.max((running_peak - stair_lo) / running_peak * 100))
             else:
                 running_trough = np.minimum.accumulate(stair_cl)
-                dd_pct = np.max((stair_hi - running_trough) / running_trough * 100)
-            if dd_pct > 1.0:
-                continue
+                dd_pct = float(np.max((stair_hi - running_trough) / running_trough * 100))
 
             # ── ALL GATES PASSED — compute SL/TP ──
             entry_level = level
@@ -516,6 +542,11 @@ def process_symbol(sym, dataset_dir, market_score_data=None):
                 "dur_hrs": round(dur_hrs, 1),
                 "vol_trend": vol_label,
                 "smma_crosses": crosses,
+                "vol_accel": round(vol_accel, 3),
+                "r2_30": round(r2_30, 4),
+                "max_candle_15m": round(max_candle_15m, 3),
+                "pct_small_15m": round(pct_small_15m, 1),
+                "max_dd_2h": round(dd_pct, 3),
                 "outcome": outcome,
                 "pnl": round(pnl, 3),
                 "mkt_score": int(mkt),
