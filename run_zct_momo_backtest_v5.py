@@ -27,9 +27,18 @@ if hasattr(sys.stdout, "reconfigure"):
 DATASET_DIR = Path("datasets/binance_futures_1m")
 MAX_BARS = 120
 MIN_VOL_5M_USD = 500_000
-OUTPUT_CSV = "zct_momo_results.csv"
-LOG_FILE = "zct_momo_log.txt"
+OUTPUT_CSV = "zct_momo_results_v5.csv"
+LOG_FILE = "zct_momo_log_v5.txt"
 SCAN_FROM = None  # None = full dataset
+
+# Symbols too slow/large for momo — exclude from scanning
+EXCLUDED_SYMBOLS = {
+    "BTCUSDT", "BNBUSDT", "ETHUSDT", "XRPUSDT", "LTCUSDT",
+    "PAXGUSDT", "XAUUSDT", "XAGUSDT", "XPTUSDT", "BCHUSDT", "YFIUSDT",
+}
+
+MAX_PRICE = 100.0      # skip coins priced above $100
+MIN_2H_MOVE_PCT = 0.0  # disabled for now
 
 
 def log(msg):
@@ -248,6 +257,8 @@ def load_market_scores(dataset_dir):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def process_symbol(sym, dataset_dir, market_score_data=None):
+    if sym in EXCLUDED_SYMBOLS:
+        return []
     fpath = dataset_dir / f"{sym}_1m.csv"
     if not fpath.exists():
         return []
@@ -362,6 +373,18 @@ def process_symbol(sym, dataset_dir, market_score_data=None):
         if np.isnan(hi6h[i]) or np.isnan(lo6h[i]):
             continue
 
+        # ── CHEAP: Price cap ──
+        if c[i] > MAX_PRICE:
+            continue
+
+        # ── CHEAP: 2h price move minimum ──
+        if i >= 120:
+            move_2h = abs(c[i] - c[i - 120]) / c[i - 120] * 100
+            if move_2h < MIN_2H_MOVE_PCT:
+                continue
+        else:
+            continue
+
         signals = []
         if can_long and c[i] > hi6h[i]:
             signals.append(("long", hi6h[i]))
@@ -374,10 +397,19 @@ def process_symbol(sym, dataset_dir, market_score_data=None):
         for direction, level in signals:
             is_long = direction == "long"
 
-            # ── GATE: Duration — 2h+ on correct side of SMMA30 ──
-            if is_long and streak_above[i] < min_dur_bars:
+            # ── GATE: Duration — 2h with ≤2 debounced SMMA30 crosses ──
+            # Price must be on correct side at entry
+            if is_long and c[i] < smma30[i]:
                 continue
-            if not is_long and streak_below[i] < min_dur_bars:
+            if not is_long and c[i] > smma30[i]:
+                continue
+            # Count debounced crosses in last 2h
+            dur_c = c[max(0, i - min_dur_bars + 1):i + 1]
+            dur_sm = smma30[max(0, i - min_dur_bars + 1):i + 1]
+            if len(dur_c) < min_dur_bars:
+                continue
+            dur_crosses = _count_smma_crosses(dur_c, dur_sm)
+            if dur_crosses > 3:
                 continue
 
             # ── GATE: SMMA30 trending (not flat/sideways) ──
@@ -394,10 +426,33 @@ def process_symbol(sym, dataset_dir, market_score_data=None):
 
             # ── GATE: Low noise (SMMA30 crosses ≤ 6 in 2h) ──
             stair_c = c[max(0, i - 119):i + 1]
+            stair_h = h[max(0, i - 119):i + 1]
+            stair_l = l[max(0, i - 119):i + 1]
             stair_sm = smma30[max(0, i - 119):i + 1]
             crosses = _count_smma_crosses(stair_c, stair_sm)
             if crosses > 6:
                 continue
+
+            # ── GATE: R² > 0.85 and channel < 0.25% over last 2h ──
+            if len(stair_c) >= 60:
+                n_s = len(stair_c)
+                x_s = np.arange(n_s, dtype=float)
+                xm, ym = np.mean(x_s), np.mean(stair_c)
+                sxy = np.sum((x_s - xm) * (stair_c - ym))
+                sxx = np.sum((x_s - xm) ** 2)
+                syy = np.sum((stair_c - ym) ** 2)
+                if sxx > 0 and syy > 0:
+                    r2 = (sxy ** 2) / (sxx * syy)
+                    slope = sxy / sxx
+                    pred = slope * x_s + (ym - slope * xm)
+                    std_res = np.std(stair_c - pred)
+                    channel = std_res / ym * 100 * 2 if ym > 0 else 99
+                    if r2 < 0.85:
+                        continue
+                    if channel > 0.25:
+                        continue
+                else:
+                    continue
 
             # ── GATE: Grind approach (no spike into the level) ──
             if i >= 10:
@@ -415,10 +470,15 @@ def process_symbol(sym, dataset_dir, market_score_data=None):
                     if accel > 3.0 and max_bar_pct > 0.3:
                         continue
 
-            # ── GATE: Volume — nama30 not falling ──
+            # ── GATE: Volume — longs: nama30 not falling. Shorts: allow decreasing, block flat ──
             if i >= 11 and not np.isnan(nama30[i]) and not np.isnan(nama30[i - 10]):
-                if nama30[i] < nama30[i - 10] * 0.95:  # allow slight decline
+                if is_long and nama30[i] < nama30[i - 10] * 0.95:
                     continue
+                # Shorts: block flat volume (ratio ~1.0), allow decreasing or increasing
+                if not is_long:
+                    vol_ratio = nama30[i] / nama30[i - 10] if nama30[i - 10] > 0 else 1.0
+                    if 0.95 <= vol_ratio <= 1.05:  # flat = bad for shorts
+                        continue
 
             # ── GATE: VWAP side ──
             if is_long and c[i] < vwap[i]:
@@ -493,10 +553,9 @@ def process_symbol(sym, dataset_dir, market_score_data=None):
                 continue
 
             # ── DPS scoring ──
-            # Duration: based on streak for hours, but score=2 uses 2h cross count
-            dur_hrs = (streak_above[i] if is_long else streak_below[i]) / 60.0
-            # Score=2 if 0 crosses in 2h (cleanest staircase), score=1 otherwise (already passed <=6 gate)
-            dps_dur = 2 if crosses == 0 else 1
+            # Duration: score=2 if 0 crosses in 2h, score=1 if 1-3 crosses (passed gate)
+            dur_hrs = min_dur_bars / 60.0  # 2h window
+            dps_dur = 2 if dur_crosses == 0 else 1
 
             if i >= 10:
                 sr = spike_ratio
@@ -504,15 +563,25 @@ def process_symbol(sym, dataset_dir, market_score_data=None):
             else:
                 dps_app = 1
 
-            # Volume DPS
+            # Volume DPS — ZCT scoring:
+            #   Longs:  increasing(2) > flat(1) > decreasing(0)
+            #   Shorts: increasing(2) > decreasing(1) > flat(0)
             if i >= 11 and not np.isnan(nama30[i]) and not np.isnan(nama30[i - 10]):
                 vol_change = (nama30[i] - nama30[i - 10]) / nama30[i - 10] if nama30[i - 10] > 0 else 0
                 if vol_change > 0.05:
                     dps_vol = 2; vol_label = "increasing"
                 elif vol_change > -0.05:
-                    dps_vol = 1; vol_label = "flat"
+                    # Flat
+                    if is_long:
+                        dps_vol = 1; vol_label = "flat"
+                    else:
+                        dps_vol = 0; vol_label = "flat"
                 else:
-                    dps_vol = 0; vol_label = "decreasing"
+                    # Decreasing
+                    if is_long:
+                        dps_vol = 0; vol_label = "decreasing"
+                    else:
+                        dps_vol = 1; vol_label = "decreasing"
             else:
                 dps_vol = 1; vol_label = "flat"
 
