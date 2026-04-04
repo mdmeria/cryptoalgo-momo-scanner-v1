@@ -144,6 +144,9 @@ class WSTrader:
         # Pending limit orders: {orderId: {symbol, side, tp, sl, qty, setup, placed_at}}
         self._pending_limit_orders: dict[str, dict] = {}
 
+        # Pending momo/zct_momo confirms: {key: {confirm state, setup, etc.}}
+        self._pending_momo_confirms: dict[str, dict] = {}
+
         # Depth watchlist: {symbol: {setup details, created_at}}
         self._depth_watchlist: dict[str, dict] = {}
 
@@ -235,6 +238,7 @@ class WSTrader:
 
                 # Manage pending limit orders (3 min expiry)
                 self._manage_pending_orders()
+                self._manage_momo_confirms()
             except Exception as e:
                 logger.error("Periodic task error: %s", e)
             await asyncio.sleep(2)  # check every 2 seconds for batched candles
@@ -319,9 +323,171 @@ class WSTrader:
         for oid in to_remove:
             self._pending_limit_orders.pop(oid, None)
 
+    def _manage_momo_confirms(self):
+        """Manage pending momo/zct_momo: confirm bars → place limit → 0.75R cancel → expiry."""
+        if not self._pending_momo_confirms:
+            return
+
+        expired_keys = []
+        for key, pend in list(self._pending_momo_confirms.items()):
+            sym = pend["symbol"]
+            side = pend["side"]
+            strat = pend["strat"]
+            elapsed = time.time() - pend["placed_at"]
+            limit_price = pend["entry_price"]
+            confirm_needed = pend["confirm_needed"]
+
+            if sym not in self.candle_cache or len(self.candle_cache[sym]) < 2:
+                continue
+            full_df = self.candle_cache[sym]
+            last_bar = full_df.iloc[-2]  # closed bar
+            last_high = float(last_bar["high"])
+            last_low = float(last_bar["low"])
+            last_close = float(last_bar["close"])
+
+            # Phase 1: Confirm bars
+            if not pend["confirmed"]:
+                if side == "long":
+                    onside = last_close > limit_price
+                else:
+                    onside = last_close < limit_price
+                if onside:
+                    pend["confirm_count"] += 1
+                else:
+                    logger.info("    MISSED %s %s %s: confirm failed bar %d",
+                                strat.upper(), side.upper(), sym,
+                                pend["confirm_count"] + 1)
+                    log_trade(pend["setup"], f"MISSED_{strat.upper()}_CONFIRM")
+                    expired_keys.append(key)
+                    continue
+
+                if pend["confirm_count"] >= confirm_needed:
+                    pend["confirmed"] = True
+                    pend["confirmed_at"] = time.time()
+                    logger.info("    CONFIRMED %s %s %s: %d-bar passed",
+                                strat.upper(), side.upper(), sym, confirm_needed)
+
+                    # Now place limit order on exchange (if live mode)
+                    if pend["strat_mode"] == "live":
+                        trading_cfg = self.config["trading"]
+                        if sym not in self._margin_configured:
+                            self.client.ensure_margin_and_leverage(
+                                sym, trading_cfg["leverage"], trading_cfg["margin_mode"])
+                            self._margin_configured.add(sym)
+
+                        lp = str(round(limit_price, 8))
+                        order_result = self.client.place_order(
+                            symbol=sym, side=pend["order_side"],
+                            qty=pend["qty"],
+                            order_type="LIMIT", price=lp,
+                            tp_price=pend["tp_price"],
+                            sl_price=pend["sl_price"],
+                            tp_sl_type=trading_cfg.get("tp_sl_type", "mark_price"))
+
+                        order_id = order_result.get("data", {}).get("orderId")
+                        if order_id:
+                            pend["exchange_order_id"] = order_id
+                            logger.info("    LIMIT PLACED %s %s %s: id=%s price=%s (10min expiry)",
+                                        strat.upper(), side.upper(), sym, order_id, lp)
+                        else:
+                            logger.error("    LIMIT PLACE FAILED %s: %s",
+                                         sym, order_result.get("msg", "Unknown"))
+                            expired_keys.append(key)
+                continue
+
+            # Phase 2: 0.75R cancel check
+            cancel_price = pend["cancel_075r_price"]
+            if side == "long" and last_high >= cancel_price:
+                logger.info("    MISSED %s %s %s: 0.75R cancel (%.6g >= %.6g)",
+                            strat.upper(), side.upper(), sym, last_high, cancel_price)
+                self._cancel_momo_exchange_order(pend)
+                log_trade(pend["setup"], f"MISSED_{strat.upper()}_075R")
+                expired_keys.append(key)
+                continue
+            if side == "short" and last_low <= cancel_price:
+                logger.info("    MISSED %s %s %s: 0.75R cancel (%.6g <= %.6g)",
+                            strat.upper(), side.upper(), sym, last_low, cancel_price)
+                self._cancel_momo_exchange_order(pend)
+                log_trade(pend["setup"], f"MISSED_{strat.upper()}_075R")
+                expired_keys.append(key)
+                continue
+
+            # Phase 3: Check fill
+            if pend["strat_mode"] == "live" and pend.get("exchange_order_id"):
+                # Check exchange for fill
+                positions = self.client.get_positions(sym)
+                if len(positions) > 0:
+                    pos = positions[0]
+                    setup = pend["setup"]
+                    setup["order_id"] = pend["exchange_order_id"]
+                    setup["exchange_position_id"] = pos.get("positionId")
+                    setup["qty"] = float(pos.get("qty") or 0)
+                    setup["actual_fill"] = float(pos.get("avgOpenPrice") or 0)
+                    setup["risk_pct"] = pend["risk_pct"]
+                    setup["market_score"] = self.market_cond.score
+                    setup["bars_held"] = 0
+                    setup["mode"] = "live"
+                    setup["fill_time_sec"] = round(elapsed, 1)
+                    setup["entry_depth_snapshot"] = pend.get("entry_depth_snapshot")
+                    self.pos_tracker.add_position(setup)
+                    log_trade(setup, f"ENTRY_LIVE_LIMIT_{strat.upper()}")
+                    logger.info("    FILLED %s %s %s: fill=%.6g waited=%.0fs",
+                                strat.upper(), side.upper(), sym,
+                                setup["actual_fill"], elapsed)
+                    expired_keys.append(key)
+                    continue
+            elif pend["strat_mode"] == "dummy":
+                # Dummy: check if candle crossed limit price
+                filled = False
+                if side == "long" and last_low <= limit_price:
+                    filled = True
+                elif side == "short" and last_high >= limit_price:
+                    filled = True
+                if filled:
+                    setup = pend["setup"]
+                    setup["order_id"] = f"dummy_{int(time.time())}"
+                    setup["qty"] = pend["qty"]
+                    setup["risk_pct"] = pend["risk_pct"]
+                    setup["market_score"] = self.market_cond.score
+                    setup["bars_held"] = 0
+                    setup["mode"] = "dummy"
+                    setup["fill_time_sec"] = round(elapsed, 1)
+                    setup["entry_depth_snapshot"] = pend.get("entry_depth_snapshot")
+                    self.pos_tracker.add_position(setup)
+                    log_trade(setup, f"ENTRY_DUMMY_LIMIT_{strat.upper()}")
+                    logger.info("    FILLED %s %s %s (dummy): fill=%.6g waited=%.0fs",
+                                strat.upper(), side.upper(), sym,
+                                limit_price, elapsed)
+                    expired_keys.append(key)
+                    continue
+
+            # Phase 4: Expiry
+            if elapsed >= pend.get("limit_expiry_mins", 10) * 60:
+                logger.info("    MISSED %s %s %s: expired after %.0fs",
+                            strat.upper(), side.upper(), sym, elapsed)
+                self._cancel_momo_exchange_order(pend)
+                log_trade(pend["setup"], f"MISSED_{strat.upper()}_EXPIRED")
+                expired_keys.append(key)
+
+        for k in expired_keys:
+            self._pending_momo_confirms.pop(k, None)
+
+    def _cancel_momo_exchange_order(self, pend: dict):
+        """Cancel exchange limit order if one was placed."""
+        order_id = pend.get("exchange_order_id")
+        if order_id and pend.get("strat_mode") == "live":
+            try:
+                self.client._post(
+                    "/api/v1/futures/trade/cancel_orders",
+                    {"symbol": pend["symbol"],
+                     "orderList": [{"orderId": order_id}]})
+            except Exception as e:
+                logger.debug("Cancel order error: %s", e)
+
     async def _batch_check_setups(self, symbols: list[str]):
         """Fetch depth for multiple symbols in parallel, then run strategies."""
         from live_data_collector import fetch_bitunix_depth
+        from strategy_depth import DEPTH_EXCLUDED_SYMBOLS
 
         # Filter: skip symbols with existing positions or at max capacity
         trading_cfg = self.config["trading"]
@@ -329,17 +495,14 @@ class WSTrader:
         # Symbols with pending limit orders
         pending_syms = {info["symbol"] for info in self._pending_limit_orders.values()}
 
-        # Symbols already in watchlist don't need depth fetch
-        watchlist_syms = set(self._depth_watchlist.keys())
-
         eligible = []
         for sym in symbols:
             if sym in self.pos_tracker.get_all_symbols():
                 continue
             if sym in pending_syms:
                 continue
-            if sym in watchlist_syms:
-                continue  # already watching, no depth needed
+            if sym in DEPTH_EXCLUDED_SYMBOLS:
+                continue
             if len(live_positions) >= trading_cfg["max_positions"]:
                 break
             if sym not in self.candle_cache:
@@ -414,45 +577,31 @@ class WSTrader:
                 logger.debug("Strategy error %s: %s", symbol, e)
                 return
 
-            # --- Depth: add to watchlist instead of entering ---
-            if depth_data and symbol not in self._depth_watchlist:
-                from strategy_depth import find_depth_watchlist_setup, DepthWatchlistSettings
-                wl_cfg = DepthWatchlistSettings()
-                wl_result = find_depth_watchlist_setup(depth_data, float(df.iloc[-1]["close"]), wl_cfg)
-                if wl_result["passed"]:
-                    strat_mode = self.strat_modes.get("depth", "off")
-                    if strat_mode != "off":
-                        side = wl_result["side"]
-                        if self.market_cond.is_allowed("depth", side):
-                            cd_key = f"{symbol}_depth"
-                            if time.time() - self.depth_cooldown.get(cd_key, 0) >= 1800:
-                                self._depth_watchlist[symbol] = {
-                                    **wl_result,
-                                    "created_at": time.time(),
-                                    "strat_mode": strat_mode,
-                                }
-                                logger.info("  WATCHLIST ADD %s %s: wall=%.6g dist=%.2f%% tp=%.6g sl=%.6g RR=%.2f (wait %dmin)",
-                                            side.upper(), symbol,
-                                            wl_result["entry_wall_price"],
-                                            wl_result["distance_pct"],
-                                            wl_result["tp"], wl_result["sl"],
-                                            wl_result["rr"],
-                                            wl_cfg.max_watch_minutes)
-
-            # --- MR / Momo: direct entry (unchanged) ---
+            # --- All strategies: entry logic ---
             for setup in found_setups:
                 strat = setup["strategy"]
 
-                # Skip depth — handled by watchlist above
-                if strat in ("depth", "depth_bounce"):
+                # Skip depth_bounce (not used live)
+                if strat == "depth_bounce":
                     continue
+
+                # Depth quality filters: imbalance <0.35, SL wall <5x
+                if strat == "depth":
+                    imb2 = abs(setup.get("imbalance_2pct", 0))
+                    sl_wall_str = setup.get("sl_wall_strength", 0)
+                    if imb2 >= 0.35:
+                        logger.debug("  SKIP %s: imbalance_2pct=%.2f >= 0.35", symbol, imb2)
+                        continue
+                    if sl_wall_str >= 5.0:
+                        logger.debug("  SKIP %s: sl_wall_strength=%.1fx >= 5x", symbol, sl_wall_str)
+                        continue
 
                 strat_mode = self.strat_modes.get(strat, "off")
                 if strat_mode == "off":
                     continue
 
                 side = setup["side"]
-                if strat == "momentum" and setup.get("dps_total", 0) < 4:
+                if strat in ("momentum", "zct_momo") and setup.get("dps_total", 0) < 4:
                     continue
                 if not self.market_cond.is_allowed(strat, side):
                     continue
@@ -484,6 +633,55 @@ class WSTrader:
                             entry_price, tp_price, sl_price,
                             setup["rr"], setup.get("dps_total", "?"))
 
+                # --- ZCT Momo / Momentum: pending confirm + limit order ---
+                if strat in ("zct_momo", "momentum"):
+                    pending_key = f"{symbol}_{strat}"
+                    if pending_key in self._pending_momo_confirms:
+                        continue  # already pending
+
+                    # Cancel at 75% of entry-to-TP (matches backtest)
+                    if side == "long":
+                        cancel_price = entry_price + (setup["tp"] - entry_price) * 0.75
+                    else:
+                        cancel_price = entry_price - (entry_price - setup["tp"]) * 0.75
+
+                    confirm_needed = 1 if strat == "zct_momo" else 2
+
+                    # Depth snapshot at signal time
+                    entry_depth_snap = None
+                    if depth_data:
+                        try:
+                            from depth_snapshot import compute_depth_snapshot
+                            entry_depth_snap = compute_depth_snapshot(
+                                depth_data, entry_price, setup["tp"],
+                                setup["sl"], side)
+                        except Exception:
+                            pass
+
+                    self._pending_momo_confirms[pending_key] = {
+                        "symbol": symbol, "side": side, "strat": strat,
+                        "strat_mode": strat_mode,
+                        "entry_price": entry_price,
+                        "tp_price": tp_price, "sl_price": sl_price,
+                        "cancel_075r_price": round(cancel_price, 8),
+                        "order_side": order_side,
+                        "qty": qty, "risk_pct": risk_pct,
+                        "setup": setup,
+                        "placed_at": time.time(),
+                        "confirm_count": 0,
+                        "confirm_needed": confirm_needed,
+                        "confirmed": False,
+                        "exchange_order_id": None,
+                        "limit_expiry_mins": 10,
+                        "entry_depth_snapshot": entry_depth_snap,
+                    }
+                    logger.info("    PENDING %s %s %s: awaiting %d-bar confirm, "
+                                "limit=%.6g cancel_075=%.6g (10min expiry)",
+                                strat.upper(), side.upper(), symbol,
+                                confirm_needed, entry_price, cancel_price)
+                    continue
+
+                # --- Dummy mode: immediate local entry ---
                 if strat_mode == "dummy":
                     setup["order_id"] = f"dummy_{int(time.time())}"
                     setup["qty"] = qty
@@ -501,12 +699,33 @@ class WSTrader:
                             symbol, trading_cfg["leverage"], trading_cfg["margin_mode"])
                         self._margin_configured.add(symbol)
 
-                    if strat in ("depth", "depth_bounce"):
-                        # Depth handled by watchlist — should not reach here
-                        continue
+                    if strat == "depth":
+                        # LIMIT order for depth — zero slippage, 3 min expiry
+                        limit_price = str(round(entry_price, 8))
+                        order_result = self.client.place_order(
+                            symbol=symbol, side=order_side, qty=qty,
+                            order_type="LIMIT", price=limit_price,
+                            tp_price=tp_price, sl_price=sl_price,
+                            tp_sl_type=trading_cfg["tp_sl_type"])
+
+                        order_id = order_result.get("data", {}).get("orderId")
+                        if order_id:
+                            self._pending_limit_orders[order_id] = {
+                                "symbol": symbol, "side": side,
+                                "entry_price": limit_price,
+                                "tp_price": tp_price, "sl_price": sl_price,
+                                "qty": qty, "setup": setup,
+                                "risk_pct": risk_pct,
+                                "placed_at": time.time(),
+                            }
+                            logger.info("    LIMIT ORDER: %s %s price=%s qty=%s id=%s (3min expiry)",
+                                        symbol, side.upper(), limit_price, qty, order_id)
+                        else:
+                            logger.error("    LIMIT FAILED: %s — %s",
+                                         symbol, order_result.get("msg", "Unknown"))
 
                     else:
-                        # MARKET order for Momo — immediate fill with TP/SL
+                        # MARKET order for MR — immediate fill with TP/SL
                         result = self.client.place_order_and_verify(
                             symbol=symbol, side=order_side, qty=qty,
                             tp_price=tp_price, sl_price=sl_price,
@@ -599,13 +818,24 @@ class WSTrader:
                 "close": float(last_bar["close"]),
             }
 
-            # Check wall touch
+            # Check wall touch (with closes_beyond tracking)
+            closes_beyond = wl.get("closes_beyond", 0)
+            max_closes = wl.get("max_closes_beyond", 2)
             status = check_wall_touch(candle, wl["entry_wall_price"],
-                                       wl["side"], wl["invalidation_price"])
+                                       wl["side"], wl["invalidation_price"],
+                                       closes_beyond=closes_beyond,
+                                       max_closes_beyond=max_closes)
 
-            if status == "broken":
-                logger.info("  WATCH BROKEN: %s — candle closed beyond wall %.6g (close=%.6g)",
-                            symbol, wl["entry_wall_price"], candle["close"])
+            if status == "touched":
+                # Closed beyond wall but still within tolerance
+                wl["closes_beyond"] = closes_beyond + 1
+                logger.info("  WATCH TOUCHED: %s — close=%.6g beyond wall %.6g (%d/%d allowed)",
+                            symbol, candle["close"], wl["entry_wall_price"],
+                            wl["closes_beyond"], max_closes)
+
+            elif status == "broken":
+                logger.info("  WATCH BROKEN: %s — %d closes beyond wall %.6g (close=%.6g)",
+                            symbol, closes_beyond + 1, wl["entry_wall_price"], candle["close"])
                 log_trade({"symbol": symbol, "strategy": "depth", "side": wl["side"],
                            "entry": wl["entry_price"], "tp": wl["tp"], "sl": wl["sl"],
                            "rr": wl["rr"], "entry_wall_price": wl["entry_wall_price"],
@@ -615,9 +845,9 @@ class WSTrader:
                 to_remove.append(symbol)
 
             elif status == "confirmed":
-                # Wall touched and held! Re-check wall strength before entering
-                logger.info("  WATCH CONFIRMED: %s — wick touched wall %.6g, close=%.6g (wall held!)",
-                            symbol, wl["entry_wall_price"], candle["close"])
+                # Wall touched and close back on correct side — enter!
+                logger.info("  WATCH CONFIRMED: %s — close=%.6g back above wall %.6g (held after %d touches!)",
+                            symbol, candle["close"], wl["entry_wall_price"], closes_beyond)
 
                 # Re-fetch depth to verify wall still exists
                 fresh_depth = fetch_bitunix_depth(symbol, limit="max")
@@ -790,9 +1020,14 @@ class WSTrader:
                 pnl_pct = ct.get("pnl_pct", 0)
                 realized = ct.get("realized_pnl", 0)
                 fee = ct.get("fee", 0)
-                logger.info("  %s %s %s %s: close=%.6g PnL=%.2f%% realized=$%.2f fee=$%.2f",
+                trailed = " [TRAILED]" if ct.get("sl_trailed") else ""
+                logger.info("  %s %s %s %s: close=%.6g PnL=%.2f%% realized=$%.2f fee=$%.2f%s",
                              outcome, ct["strategy"].upper(), ct["side"].upper(),
-                             ct["symbol"], close_price, pnl_pct, realized, fee)
+                             ct["symbol"], close_price, pnl_pct, realized, fee, trailed)
+                # Include trail info in trade log
+                if ct.get("sl_trailed"):
+                    ct["outcome"] = f"{outcome}_TRAILED"
+                    ct["sl_original"] = ct.get("sl_original", ct["sl"])
                 log_trade(ct, "CLOSED")
                 # Track daily PnL using account-relative risk
                 risk_pct = ct.get("risk_pct", 0.1)
@@ -1107,10 +1342,7 @@ class WSTrader:
                 break  # One setup per symbol per candle
 
     def _check_trail_sl(self):
-        """Trail SL disabled — rely on exchange TP/SL only.
-        Will revisit with better logic later."""
-        return
-        # --- DISABLED ---
+        """Trail SL: when price reaches 0.9R, move SL to 0.1R (one-time)."""
         with self._lock:
             for pos in self.pos_tracker.local_positions:
                 sym = pos["symbol"]
@@ -1135,20 +1367,6 @@ class WSTrader:
                     entry = pos["entry"]
                 sl_orig = pos.get("sl_original", pos["sl"])
 
-                # bars_held: use time-based counting (minutes since entry)
-                entry_ts = pos.get("timestamp", "")
-                if entry_ts:
-                    try:
-                        import pandas as _pd
-                        entry_time = _pd.Timestamp(entry_ts)
-                        now_time = _pd.Timestamp.now(tz="UTC")
-                        bars_elapsed = int((now_time - entry_time).total_seconds() / 60)
-                    except Exception:
-                        bars_elapsed = pos.get("bars_held", 0)
-                else:
-                    bars_elapsed = pos.get("bars_held", 0)
-                pos["bars_held"] = bars_elapsed
-
                 should_trail = False
                 if pos["side"] == "long":
                     r_dist = entry - sl_orig
@@ -1158,8 +1376,6 @@ class WSTrader:
                     new_sl = entry + r_dist * 0.1
                     if current_high >= target_09r:
                         should_trail = True
-                    elif bars_elapsed >= 60 and current_close > entry:
-                        should_trail = True
                 else:
                     r_dist = sl_orig - entry
                     if r_dist <= 0:
@@ -1167,8 +1383,6 @@ class WSTrader:
                     target_09r = entry - r_dist * 0.9
                     new_sl = entry - r_dist * 0.1
                     if current_low <= target_09r:
-                        should_trail = True
-                    elif bars_elapsed >= 60 and current_close < entry:
                         should_trail = True
 
                 if should_trail:
@@ -1183,16 +1397,28 @@ class WSTrader:
                             valid_sl = False
 
                         if valid_sl:
-                            logger.info("  TRAIL SL %s %s %s: SL -> %.6g (entry=%.6g, 0.9R=%.6g, bars=%d)",
+                            logger.info("  TRAIL SL %s %s %s: SL %.6g -> %.6g (entry=%.6g, 0.9R=%.6g)",
                                         pos["strategy"], pos["side"], sym,
-                                        new_sl, entry, target_09r, bars_elapsed)
+                                        pos["sl"], new_sl, entry, target_09r)
                             self.client.modify_tp_sl(
                                 sym, pos_id,
                                 sl_price=str(round(new_sl, 8)),
                                 qty=str(pos_qty))
+                            # Log trail event to trades.csv for analysis
+                            log_trade({
+                                "symbol": sym, "strategy": pos["strategy"],
+                                "side": pos["side"], "entry": entry,
+                                "sl": round(new_sl, 8), "tp": pos.get("tp"),
+                                "sl_pct": round(abs(new_sl - entry) / entry * 100, 3),
+                                "rr": pos.get("rr"),
+                                "risk_pct": pos.get("risk_pct"),
+                                "market_score": pos.get("market_score"),
+                                "close_price": current_close,
+                                "sl_original": pos["sl"],
+                            }, "TRAIL_SL_MOVED")
                         else:
-                            logger.info("  TRAIL SL skip %s: price=%.6g past new_sl=%.6g (bars=%d)",
-                                        sym, current_close, new_sl, bars_elapsed)
+                            logger.info("  TRAIL SL skip %s: price=%.6g past new_sl=%.6g",
+                                        sym, current_close, new_sl)
                     if "sl_original" not in pos:
                         pos["sl_original"] = pos["sl"]
                     pos["sl"] = round(new_sl, 8)
