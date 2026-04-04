@@ -43,6 +43,7 @@ class StrategyConfig:
     enable_depth_bounce: bool = True
     enable_bouncy_ball: bool = True
     enable_mr_chop: bool = True
+    enable_zct_momo: bool = False
 
     # Global filters
     min_dps_live: int = 3           # min DPS score to take a trade in live
@@ -146,6 +147,12 @@ from strategy_mr_chop import (
     check_range_shift_setup,
     check_one_sided_chop_setup,
 )
+
+# ---------------------------------------------------------------------------
+# ZCT Momo v12 — standalone gate function (ported from backtest)
+# ---------------------------------------------------------------------------
+
+from zct_momo_gates import check_zct_momo_v12_gates
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +536,17 @@ def detect_setups(df: pd.DataFrame, symbol: str,
                 }
                 setups.append(setup)
 
+    # --- ZCT Momo v12 ---
+    if config.enable_zct_momo:
+        if len(df) >= 400 and symbol not in DEPTH_EXCLUDED_SYMBOLS:
+            df_sorted = df.sort_values("timestamp").reset_index(drop=True)
+            zct_results = check_zct_momo_v12_gates(df_sorted, symbol,
+                                                     depth_data=depth_data)
+            for zr in zct_results:
+                if zr["dps_total"] >= config.min_dps_live:
+                    setups.append(zr)
+                    break  # one direction per symbol
+
     # --- MR Chop (Range Shift + One-Sided Chop) ---
     if config.enable_mr_chop:
         min_bars_chop = 600 + 10
@@ -575,7 +593,7 @@ def detect_setups(df: pd.DataFrame, symbol: str,
 def get_risk_pct(setup: dict, config: StrategyConfig) -> float:
     """Determine risk % for a setup based on DPS confidence and pre-chop trend."""
     # Depth/bouncy_ball strategies: always dummy risk (experimental)
-    if setup.get("strategy") in ("depth", "depth_bounce", "bouncy_ball", "mr_chop"):
+    if setup.get("strategy") in ("depth", "depth_bounce", "bouncy_ball", "mr_chop", "zct_momo"):
         return config.dummy_risk_pct
 
     # MR: force dummy on unclear pre-chop trend
@@ -706,7 +724,7 @@ class MarketCondition:
         """
         s = self.score
 
-        if strategy == "momentum":
+        if strategy in ("momentum", "zct_momo"):
             # Skip momo at neutral
             if s == 0:
                 return False

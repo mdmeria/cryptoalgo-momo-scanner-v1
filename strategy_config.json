@@ -16,5 +16,6 @@
   "enable_bouncy_ball": false,
   "max_positions_bouncy_ball": 10,
   "enable_mr_chop": true,
-  "max_positions_mr_chop": 10
+  "max_positions_mr_chop": 10,
+  "enable_zct_momo": true
 }
