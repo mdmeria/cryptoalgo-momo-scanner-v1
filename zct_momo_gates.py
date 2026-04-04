@@ -181,7 +181,10 @@ def check_zct_momo_v12_gates(df: pd.DataFrame, symbol: str,
     # ── Precompute indicators ──
     smma30 = pd.Series(c).ewm(alpha=1.0 / 30, adjust=False).mean().values
     smma5 = pd.Series(c).ewm(alpha=1.0 / 5, adjust=False).mean().values
-    vol_usd = vol  # Bitunix quoteVol is already USD
+    # vol * close = USD volume (matches backtest which uses Binance raw vol * close)
+    # Bitunix quoteVol is already USD, but we multiply anyway to stay consistent
+    # with backtest indicator computation on nama30
+    vol_usd = vol * c
     nama30 = _nama(vol_usd, seed_len=30)
 
     # Wick ratio (suppress divide warnings for zero-range bars)
@@ -197,8 +200,8 @@ def check_zct_momo_v12_gates(df: pd.DataFrame, symbol: str,
     hi6h = np.max(h[i - 361:i])
     lo6h = np.min(l[i - 361:i])
 
-    # 5-min volume
-    vol_5m = vol_usd[max(0, i - 4):i + 1].sum()
+    # 5-min volume (prior 5 bars, excluding current — matches backtest)
+    vol_5m = vol_usd[max(0, i - 5):i].sum()
 
     # VWAP (session — daily reset)
     tp_arr = (h + l + c) / 3.0
@@ -283,31 +286,32 @@ def check_zct_momo_v12_gates(df: pd.DataFrame, symbol: str,
         if crosses > 6:
             continue
 
-        # ── GATE: SMMA5 alignment + trending ──
+        # ── GATE: SMMA5 alignment + trending (nested — matches backtest) ──
         stair_sm5 = smma5[max(0, i - 119):i + 1]
         stair_sm30 = smma30[max(0, i - 119):i + 1]
-        if len(stair_sm5) < 60:
-            continue
-        if is_long:
-            sm5_pct = np.sum(stair_sm5 > stair_sm30) / len(stair_sm5) * 100
-        else:
-            sm5_pct = np.sum(stair_sm5 < stair_sm30) / len(stair_sm5) * 100
-        if sm5_pct < 80:
-            continue
-
-        # SMMA5 R² > 0.95
-        n_sm5 = len(stair_sm5)
-        x_sm5 = np.arange(n_sm5, dtype=float)
-        xm5, ym5 = np.mean(x_sm5), np.mean(stair_sm5)
-        sxy5 = np.sum((x_sm5 - xm5) * (stair_sm5 - ym5))
-        sxx5 = np.sum((x_sm5 - xm5) ** 2)
-        syy5 = np.sum((stair_sm5 - ym5) ** 2)
-        if sxx5 > 0 and syy5 > 0:
-            r2_sm5 = (sxy5 ** 2) / (sxx5 * syy5)
-            if r2_sm5 < 0.95:
+        r2_sm5 = 0.0
+        if len(stair_sm5) >= 60:
+            # SMMA5 on correct side of SMMA30 for 80%+
+            if is_long:
+                sm5_pct = np.sum(stair_sm5 > stair_sm30) / len(stair_sm5) * 100
+            else:
+                sm5_pct = np.sum(stair_sm5 < stair_sm30) / len(stair_sm5) * 100
+            if sm5_pct < 80:
                 continue
-        else:
-            continue
+
+            # SMMA5 R² > 0.95
+            n_sm5 = len(stair_sm5)
+            x_sm5 = np.arange(n_sm5, dtype=float)
+            xm5, ym5 = np.mean(x_sm5), np.mean(stair_sm5)
+            sxy5 = np.sum((x_sm5 - xm5) * (stair_sm5 - ym5))
+            sxx5 = np.sum((x_sm5 - xm5) ** 2)
+            syy5 = np.sum((stair_sm5 - ym5) ** 2)
+            if sxx5 > 0 and syy5 > 0:
+                r2_sm5 = (sxy5 ** 2) / (sxx5 * syy5)
+                if r2_sm5 < 0.95:
+                    continue
+            else:
+                continue
 
         # ── GATE: Staircase step detection (5/7 segments) ──
         n_segs = 8

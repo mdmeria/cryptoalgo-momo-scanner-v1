@@ -701,11 +701,11 @@ class WSDummyTrader:
                 if strat == "zct_momo":
                     limit_key = f"{symbol}_zct_momo"
                     if limit_key not in self.pending_limits:
-                        r_dist = abs(setup["entry"] - setup["sl"])
+                        # Cancel at 75% of way to TP (matches backtest)
                         if side == "long":
-                            cancel_price = setup["entry"] + r_dist * 0.75
+                            cancel_price = setup["entry"] + (setup["tp"] - setup["entry"]) * 0.75
                         else:
-                            cancel_price = setup["entry"] - r_dist * 0.75
+                            cancel_price = setup["entry"] - (setup["entry"] - setup["tp"]) * 0.75
 
                         depth_alt = None
                         if depth_data:
