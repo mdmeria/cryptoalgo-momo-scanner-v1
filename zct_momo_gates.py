@@ -221,9 +221,10 @@ def check_zct_momo_v12_gates(df: pd.DataFrame, symbol: str,
     if cum_vol > 0:
         vwap_val = cum_tp_vol / cum_vol
 
-    # ── CHEAPEST: 5-min volume ──
-    if vol_5m < MIN_VOL_5M_USD:
-        return []
+    # ── 5-min volume gate SKIPPED in live ──
+    # Orion already filters coins by volume from Binance/TradingView data.
+    # Bitunix volume is much lower than Binance for the same coin,
+    # so this gate would reject almost everything if applied to Bitunix data.
 
     # ── CHEAP: Price cap ──
     if c[i] > MAX_PRICE:
